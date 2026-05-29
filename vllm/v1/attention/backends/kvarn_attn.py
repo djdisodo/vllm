@@ -755,7 +755,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         D = cfg.head_dim
         Hq = self.num_heads
         Hk = self.num_kv_heads
-        q_rows = max(self._max_num_batched_tokens, 1)
+        # Decode scratch rows. The decode driver indexes these buffers by
+        # N = B * Hq (decode batch * query heads), so they must hold the largest
+        # decode N as well as any prefill token count. A decode step (incl. its
+        # CUDA-graph capture batch) has at most max_num_seqs queries, so the
+        # decode bound is max_num_seqs * Hq. Sizing to the max of that and
+        # max_num_batched_tokens makes the buffers correct for ANY
+        # max_num_batched_tokens (the old code silently assumed
+        # max_num_batched_tokens >= max_num_seqs * Hq, which breaks when it is
+        # set low — e.g. a small chunked-prefill budget on a wide model).
+        q_rows = max(self._max_num_batched_tokens, self._max_num_seqs * Hq, 1)
         # FA packed K/V scratch holds the total KV tokens attended in ONE
         # decode step (= sum of the batch's context lengths). The theoretical
         # bound max_num_seqs * max_model_len is pathological (e.g. 256×8192 =
