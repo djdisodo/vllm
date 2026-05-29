@@ -349,6 +349,21 @@ class CudaPlatformBase(Platform):
                 "`wsl --shutdown`."
             )
 
+        cache_config = vllm_config.cache_config
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        if isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_"):
+            # KVarN is a full-attention KV quantizer; its decode path does not
+            # implement a sliding-window mask. Keep sliding-window layers in the
+            # default full-precision dtype so hybrid/SWA models stay correct.
+            skip_layers = cache_config.kv_cache_dtype_skip_layers
+            if "sliding_window" not in skip_layers:
+                skip_layers.append("sliding_window")
+                logger.info(
+                    "KVarN (%s): sliding-window attention layers (if any) are "
+                    "kept in full precision; KVarN compresses full-attention "
+                    "layers only.",
+                    cache_dtype,
+                )
     @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
