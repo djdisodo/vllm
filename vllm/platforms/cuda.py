@@ -352,6 +352,18 @@ class CudaPlatformBase(Platform):
         cache_config = vllm_config.cache_config
         cache_dtype = getattr(cache_config, "cache_dtype", None)
         if isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_"):
+            # KVarN's Sinkhorn/decode kernels are specialized to head_dim=128
+            # (the variance-normalization tile is 128x128). Fail fast with a
+            # clear message rather than crashing deep in a kernel with a shape
+            # error if the model uses a different head dimension.
+            head_size = model_config.get_head_size() if model_config else None
+            if head_size is not None and head_size != 128:
+                raise ValueError(
+                    f"{cache_dtype} requires head_dim=128, but this model has "
+                    f"head_dim={head_size}. KVarN currently supports head_dim=128 "
+                    f"only; use a different --kv-cache-dtype for this model."
+                )
+
             # KVarN is a full-attention KV quantizer; its decode path does not
             # implement a sliding-window mask. Keep sliding-window layers in the
             # default full-precision dtype so hybrid/SWA models stay correct.
