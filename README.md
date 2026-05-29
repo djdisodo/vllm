@@ -1,110 +1,94 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![GitHub stars](https://img.shields.io/github/stars/huawei-csl/KVarN?label=Stars&logo=github&logoColor=white&style=flat-square)](https://github.com/huawei-csl/KVarN/stargazers)
+[![hf-space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Huawei%20CSL-ffc107?color=ffc107&logoColor=white)](https://huggingface.co/huawei-csl)
+[![Built on vLLM](https://img.shields.io/badge/Built%20on-vLLM%20v0.22.0-30a14e)](https://github.com/vllm-project/vllm)
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+<table border="0" cellspacing="0" cellpadding="0">
+  <tr>
+    <td><img src="imgs/logo_600.png" alt="KVarN Logo" width="160"></td>
+    <td style="vertical-align: middle;"><h1>KVarN: Variance-Normalized KV-Cache Quantization for vLLM</h1></td>
+  </tr>
+</table>
+
+
+
+> ⚡️ **Near-lossless KV-cache compression for vLLM.** Fit far longer contexts, sustain higher long-context throughput, and keep FP16-level accuracy.
+
+> 💡 **Want longer context or more concurrent requests on the same GPU?** KVarN shrinks the KV cache by 3-5x while preserving model quality, even on reasoning models.
+
+> 🔌 **Drop-in.** It is a native vLLM attention backend: add one flag, no model changes, no calibration.
 
 ---
 
-## About
+## Quickstart
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
-
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
-
-vLLM is fast with:
-
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
-
-vLLM is flexible and easy to use with:
-
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+KVarN ships as a vLLM fork. Install it like vLLM, then select the KVarN KV-cache dtype.
 
 ```bash
-uv pip install vllm
+# 1. Clone
+git clone https://github.com/huawei-csl/KVarN.git
+cd KVarN
+
+# 2. Install (uses the upstream precompiled wheel; KVarN kernels are Triton, JIT-compiled at runtime)
+VLLM_USE_PRECOMPILED=1 pip install -e .
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+```python
+from vllm import LLM, SamplingParams
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
-
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
-
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
+llm = LLM(
+    model="Qwen/Qwen3-32B",
+    kv_cache_dtype="kvarn_k4v2_g128",   # enable KVarN
+    block_size=128,                     # KVarN tile size
+)
+print(llm.generate("Explain KV-cache quantization in one sentence.",
+                    SamplingParams(max_tokens=64))[0].outputs[0].text)
 ```
 
-## Contact Us
+Serving works the same way:
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+```bash
+vllm serve Qwen/Qwen3-32B --kv-cache-dtype kvarn_k4v2_g128 --block-size 128
+```
 
-## Media Kit
+---
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+## How does KVarN work?
+
+KVarN quantizes the KV cache one fixed-size token tile at a time, in three steps:
+
+1. **Hadamard rotation** along the channel dimension. This mixes channels so that
+   per-channel outliers are spread out, making the tile easier to quantize. The
+   rotation is orthonormal, so attention scores are preserved.
+
+2. **Iterative variance normalization** (Sinkhorn-like). Alternating column-wise
+   and row-wise standard-deviation normalization in log space equalizes the
+   variance across rows and columns of the tile. Balancing the tile this way
+   shrinks the quantization error before any rounding happens.
+
+3. **Asymmetric round-to-nearest** at low bit-width, with the scales folded back
+   in at read time. Keys are quantized per channel, values per token.
+
+The shipped preset spends **more bits on keys than values** (`kvarn_k4v2_g128`:
+4-bit keys, 2-bit values). The reason is structural: key error propagates through
+the `softmax(QK^T)` exponentials, while value error is averaged out by the softmax
+weights, so keys carry most of the quantization sensitivity. The bit-widths are
+fully parameterized internally, so other presets are easy to add.
+
+---
+
+## Roadmap
+
+- Additional bit-width presets (the quantizer and kernels are bit-width generic).
+- Variable page size (tile sizes other than 128).
+- Broader model coverage and benchmarks.
+
+---
+
+## License and attribution
+
+KVarN is built on [vLLM](https://github.com/vllm-project/vllm) (v0.22.0) and is
+released under the Apache 2.0 License. The original vLLM README is preserved as
+[`README_vLLM.md`](README_vLLM.md).
