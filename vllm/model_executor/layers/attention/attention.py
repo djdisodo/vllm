@@ -659,6 +659,29 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 tq_slot_size=tq_config.slot_size_aligned,
             )
+        elif self.kv_cache_dtype.startswith("kvarn_"):
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+
+            kvarn_cfg = KVarNConfig.from_cache_dtype(
+                self.kv_cache_dtype, self.head_size
+            )
+            # KVarN's per-slot byte count = tile_bytes_aligned / block_size.
+            # We reuse the TQ spec class because the on-disk layout primitive
+            # (a uint8 block of per-(token,head) "slots") is the same; only the
+            # slot semantics differ. This gives the packed per-block page size
+            # so vLLM allocates blocks at the compressed size.
+            slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
+            return TQFullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                tq_slot_size=slot_bytes,
+            )
         else:
             return FullAttentionSpec(
                 block_size=block_size,
