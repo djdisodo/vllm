@@ -45,7 +45,7 @@ class KVarNConfig:
         group: KVarN tile size in tokens. Must equal vLLM block_size so that
             one vLLM block = one KVarN tile per head.
         sinkhorn_iters: Iterations of the alternating column/row std-norm in
-            the variance-normalization loop (default 16).
+            the variance-normalization loop (default 8; lossless vs 16).
         boundary_skip_layers: Number of leading / trailing transformer layers
             to keep in fp16 (KVarN's sink/residual analogue). Default 2 mirrors
             TurboQuant's default.
@@ -55,7 +55,7 @@ class KVarNConfig:
     key_bits: int = 4
     value_bits: int = 4
     group: int = 128
-    sinkhorn_iters: int = 16        # default; converges in practice by ~4 iters
+    sinkhorn_iters: int = 8         # converges by ~4 iters; 8 lossless vs 16 (see from_cache_dtype)
     sink_tokens: int = 128          # first N tokens per request stay fp16 (NEVER quantised)
     boundary_skip_layers: int = 0   # layer-level skipping off by default; sink_tokens replaces it
 
@@ -296,10 +296,14 @@ class KVarNConfig:
                 f"Unknown KVarN cache dtype: {cache_dtype!r}. Valid: {valid}"
             )
         preset = KVARN_PRESETS[cache_dtype]
-        # Optional env override for Sinkhorn iteration count (KVARN_SINKHORN_ITERS).
-        # Default 16 mirrors the paper; useful for testing convergence at large
-        # model scale (e.g. 48-layer 30B-A3B-Thinking-2507 may benefit from more).
-        iters = int(os.environ.get("KVARN_SINKHORN_ITERS", "16"))
+        # Sinkhorn iteration count (KVARN_SINKHORN_ITERS to override). Default 8:
+        # the variance-normalization converges in practice by ~4 iters and the
+        # kernel keeps the best-so-far scales, so 8 is lossless vs 16 (validated
+        # token-identical on Qwen3-4B / AIME25, fp16) while roughly halving the
+        # flush kernel's cost — the dominant KVarN-specific decode-GPU overhead
+        # at burst (issue #15). Raise it for large reasoning models if a
+        # convergence check shows benefit (e.g. 48-layer 30B-A3B-Thinking-2507).
+        iters = int(os.environ.get("KVARN_SINKHORN_ITERS", "8"))
         sink_tokens = int(os.environ.get("KVARN_SINK_TOKENS", "128"))
         return KVarNConfig(
             head_dim=head_dim,
