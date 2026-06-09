@@ -1043,13 +1043,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             if kvc is None:
                 continue
             dev = impl._tail_K_pool.device
+            # WSL fix: one H2D for the whole block set, slice on device per chunk
+            # (was a torch.as_tensor H2D per chunk, expensive on WSL GPU-PV).
+            slots_dev = torch.as_tensor(slots, dtype=torch.long, device=dev)
+            bids_dev = torch.as_tensor(bids, dtype=torch.long, device=dev)
             for c0 in range(0, len(bids), CHUNK_BLOCKS):
                 bchunk = bids[c0:c0 + CHUNK_BLOCKS]
-                schunk = slots[c0:c0 + CHUNK_BLOCKS]
                 nB = len(bchunk)
                 M = nB * Hk
-                slot_t = torch.as_tensor(schunk, dtype=torch.long, device=dev)
-                bid_t = torch.as_tensor(bchunk, dtype=torch.long, device=dev)
+                slot_t = slots_dev[c0:c0 + CHUNK_BLOCKS]
+                bid_t = bids_dev[c0:c0 + CHUNK_BLOCKS]
                 # One gather per chunk (was nB tiny .float() ops).
                 K_rot = impl._tail_K_pool.index_select(0, slot_t).float()  # [nB,G,Hk,D]
                 V_rot = impl._tail_V_pool.index_select(0, slot_t).float()
@@ -1527,7 +1530,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             query_start_loc=prefill_qsl,
             num_actual_tokens=N - num_decode_tokens,
             max_query_len=attn_metadata.max_query_len,
-            max_seq_len=int(prefill_seq_lens.max().item()),
+            max_seq_len=attn_metadata.max_seq_len,  # WSL fix: avoid per-step .item() D2H sync (global max is a safe upper bound for the prefill kernel)
             is_prefill=True,
         )
         k_pref = k_all[num_decode_tokens:].view(-1, self.num_kv_heads, self.head_size)
