@@ -138,6 +138,143 @@ class KVarNConfig:
     def v_zp_offset(self) -> int:
         return self.v_s_row_offset + self.group * 2
 
+    # ── fp16 tail-pool sizing ────────────────────────────────────────────────
+    # KVarN keeps a fixed-size fp16 side buffer ("tail pool") because a tile
+    # cannot be quantized until its `group` tokens all exist. Per active request,
+    # per layer, it holds two fp16 blocks: the permanent attention-sink block and
+    # the in-progress tail. The pool must be pre-allocated at a fixed size (CUDA
+    # graphs), so its size bounds how many requests can run concurrently. Rather
+    # than size the pool to an arbitrary `max_num_seqs` (which can OOM at large
+    # values or exhaust if under-sized), we pick a memory budget and cap the
+    # scheduler's concurrency to what that budget supports — see
+    # `max_supported_seqs` and the platform's check_and_update_config.
+    #
+    # The pool and the paged KV cache draw from the SAME pot: the memory left
+    # after weights (`gpu_memory_utilization · total − weights`). Sizing the pool
+    # as a fixed fraction of *total* GPU memory strangled concurrency on common
+    # setups (issue #15: a 4B on a 24GB card capped to ~30 seqs while the KV cache
+    # sat at ~3% — ~10GB of usable memory wasted). We instead give the pool a
+    # share of the post-weight usable envelope (POOL_USABLE_SHARE), which
+    # auto-scales: a small model on a big card gets a large pool / high
+    # concurrency, a model that nearly fills the card gets a small one (degrades
+    # to cap≈1, never OOMs). The legacy fraction-of-total path is kept as a
+    # fallback for when the weight size can't be read. Both tunable via
+    # KVARN_POOL_MEM_FRAC (share-of-usable when weights are known, else
+    # fraction-of-total).
+    POOL_MEM_FRAC_DEFAULT = 0.08          # legacy: fraction of TOTAL (fallback)
+    POOL_USABLE_SHARE_DEFAULT = 0.5       # share of (util·total − weights)
+
+    def _slot_bytes_per_layer(self, num_kv_heads: int) -> int:
+        """Bytes for one pool slot in one layer: group·heads·head_dim fp16,
+        for K and V combined (2 bytes/elem × 2 tensors = 4)."""
+        return self.group * num_kv_heads * self.head_dim * 4
+
+    def pool_slots(self, max_num_seqs: int, max_num_batched_tokens: int) -> int:
+        """Structural peak of fp16 pool slots needed in a single step:
+        sink + in-progress tail per active request (2·max_num_seqs), plus the
+        full blocks a chunked prefill can touch before flushing, plus headroom.
+        With concurrency capped (see max_supported_seqs) this fits the budget."""
+        prefill_blocks = (max_num_batched_tokens + self.group - 1) // self.group
+        return max(2 * max_num_seqs + prefill_blocks + 32, 64)
+
+    def pool_budget_bytes(
+        self,
+        total_gpu_bytes: int,
+        gpu_memory_utilization: float | None = None,
+        weight_bytes: int | None = None,
+    ) -> int:
+        """GPU bytes the fp16 tail pool is allowed to occupy.
+
+        Preferred (weight-aware): a share of the post-weight usable envelope,
+        ``share · (gpu_memory_utilization · total − weight_bytes)`` — the memory
+        the pool and the paged KV cache actually compete for, so the budget
+        tracks real headroom instead of an arbitrary slice of the whole card
+        (issue #15). ``share`` comes from KVARN_POOL_MEM_FRAC or
+        POOL_USABLE_SHARE_DEFAULT.
+
+        Fallback (weights unknown): the legacy ``frac · total`` with
+        POOL_MEM_FRAC_DEFAULT, so behaviour is unchanged when the weight size
+        cannot be read."""
+        env = os.environ.get("KVARN_POOL_MEM_FRAC")
+        if weight_bytes is not None and gpu_memory_utilization is not None:
+            share = float(env) if env is not None else self.POOL_USABLE_SHARE_DEFAULT
+            usable = gpu_memory_utilization * total_gpu_bytes - weight_bytes
+            return max(0, int(share * usable))
+        frac = float(env) if env is not None else self.POOL_MEM_FRAC_DEFAULT
+        return int(total_gpu_bytes * frac)
+
+    def max_supported_seqs(
+        self,
+        total_gpu_bytes: int,
+        num_kv_heads: int,
+        num_layers: int,
+        max_num_batched_tokens: int,
+        frac: float | None = None,
+        gpu_memory_utilization: float | None = None,
+        weight_bytes: int | None = None,
+    ) -> int:
+        """Largest max_num_seqs whose pool fits the pool budget.
+
+        Inverts `pool_slots`: max_slots = budget / (slot_bytes · layers), then
+        solve 2·S + prefill + 32 ≤ max_slots for S. Always ≥ 1. The budget is
+        weight-aware when `weight_bytes`/`gpu_memory_utilization` are supplied
+        (see `pool_budget_bytes`); `frac`, if given, forces the legacy
+        fraction-of-total path."""
+        if frac is not None:
+            budget = int(total_gpu_bytes * frac)
+        else:
+            budget = self.pool_budget_bytes(
+                total_gpu_bytes, gpu_memory_utilization, weight_bytes)
+        slot_bytes = self._slot_bytes_per_layer(num_kv_heads) * max(num_layers, 1)
+        max_slots = int(budget / slot_bytes)
+        prefill_blocks = (max_num_batched_tokens + self.group - 1) // self.group
+        return max(1, (max_slots - prefill_blocks - 32) // 2)
+
+    def pool_bytes(
+        self,
+        max_num_seqs: int,
+        max_num_batched_tokens: int,
+        num_kv_heads: int,
+        num_layers: int,
+    ) -> int:
+        """Total GPU bytes the fp16 tail pool occupies (this rank): pool_slots
+        summed over every layer. Reserved up front in the worker so the lazy
+        pool allocation never pushes past the KV-memory limit."""
+        slots = self.pool_slots(max_num_seqs, max_num_batched_tokens)
+        return slots * self._slot_bytes_per_layer(num_kv_heads) * max(num_layers, 1)
+
+    @staticmethod
+    def estimate_weight_bytes(model: str, tensor_parallel_size: int = 1) -> int | None:
+        """Best-effort per-rank model weight size in bytes, read from the
+        checkpoint files on disk (exact, and cheap — no CUDA context, which the
+        early `check_and_update_config` hook must avoid). Returns None if the
+        files can't be located, so the caller falls back to the legacy budget.
+
+        Resolves a local directory directly, or the local HF cache snapshot for
+        a repo id (never downloads). Sums *.safetensors (or *.bin) and divides by
+        the tensor-parallel degree (weights shard ~evenly across ranks)."""
+        import glob as _glob
+
+        try:
+            d = model
+            if not os.path.isdir(d):
+                try:
+                    from huggingface_hub import snapshot_download
+                    d = snapshot_download(model, local_files_only=True)
+                except Exception:
+                    return None
+            files = _glob.glob(os.path.join(d, "**", "*.safetensors"), recursive=True)
+            if not files:
+                files = _glob.glob(os.path.join(d, "**", "*.bin"), recursive=True)
+            if not files:
+                return None
+            total = sum(os.path.getsize(f) for f in files)
+            if total <= 0:
+                return None
+            return total // max(tensor_parallel_size, 1)
+        except Exception:
+            return None
+
     @staticmethod
     def get_boundary_skip_layers(num_layers: int, n: int = 2) -> list[str]:
         """First-N + last-N transformer layer indices as strings, suitable

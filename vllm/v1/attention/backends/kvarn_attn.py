@@ -540,6 +540,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _block_to_slot_t_per_device: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _is_sink_t_per_device: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _max_known_block_id: ClassVar[int] = 0
+    # Keys (device, D, group, k_bits, v_bits) whose flush kernels (Sinkhorn +
+    # int4 store) have already been JIT-compiled via the pool-init warmup.
+    _kernel_warmed: ClassVar[set] = set()
 
     # Registry of impls so the builder can enumerate per-layer pools when
     # it needs to update sink markers / trigger flushes.
@@ -741,6 +744,29 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # Cached fp16 Hadamard for the rotate-on-store matmul.
         if self._H_fp16 is None:
             self._H_fp16 = self._hadamard(device).to(torch.float16).contiguous()
+
+        # One-time flush-kernel warmup (issue #15). The Sinkhorn + int4-store
+        # kernels are exercised ONLY at a tile-boundary flush, which never
+        # happens during vLLM's profiling/dummy run (no request crosses a block
+        # boundary there). So they JIT-compile on the FIRST real flush DURING
+        # serving — a multi-hundred-ms stall that surfaces as a latency spike
+        # and a `jit_monitor` "JIT compilation during inference" warning, and
+        # disproportionately hurts low-concurrency aggregate throughput. Compile
+        # them here, once per shape/config, at pool-init time (outside any
+        # captured region) using the exact tile shapes / kernels the flush uses,
+        # so serving never pays the compile.
+        warm_key = (device, cfg.head_dim, cfg.group, cfg.key_bits, cfg.value_bits)
+        if warm_key not in cls._kernel_warmed:
+            D_, G_ = cfg.head_dim, cfg.group
+            k_d = torch.zeros(1, D_, G_, dtype=torch.float32, device=device)
+            v_d = torch.zeros(1, G_, D_, dtype=torch.float32, device=device)
+            _at = torch.cat([k_d, v_d], dim=0)
+            _ab, _asc, _asr = kvarn_sinkhorn_triton(_at, iterations=cfg.sinkhorn_iters)
+            kvarn_store_tile_k_batch_from_sinkhorn(
+                _ab[:1], _asc[:1], _asr[:1], bits=cfg.key_bits)
+            kvarn_store_tile_v_batch_from_sinkhorn(
+                _ab[1:], _asc[1:], _asr[1:], bits=cfg.value_bits)
+            cls._kernel_warmed.add(warm_key)
 
         # Store-side rotation scratch.
         if self._k_rot_scratch is None:
@@ -968,6 +994,98 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
     @classmethod
     def _batched_flush(cls, flush_pairs: list) -> None:
+        """Flush many (impl, block_id, kv_cache) tiles to int4.
+
+        Dispatches to the vectorized path (default) or the legacy per-tile path
+        (KVARN_FAST_FLUSH=0, kept for A/B + the tile-dump debug hook). The
+        vectorized path replaces the per-(layer,block,head) Python gather/write
+        loops — which exploded into ~10^5 tiny GPU ops on a synchronized burst
+        (prefill completion, lockstep decode boundary) and dominated build() at
+        high concurrency (issue #15: ~44 ms/step at B=256) — with one
+        index_select gather + one index_copy write per (layer, block-chunk).
+        Numerically identical: same Sinkhorn, same RTN/pack math, same byte
+        layout; only the data movement is batched."""
+        if not flush_pairs:
+            return
+        if os.environ.get("KVARN_FAST_FLUSH", "1") != "1":
+            return cls._batched_flush_legacy(flush_pairs)
+
+        cfg = flush_pairs[0][0].kvarn_config
+        Hk = flush_pairs[0][0].num_kv_heads
+        D = cfg.head_dim
+        G = cfg.group
+        T = cfg.tile_bytes_aligned
+        kpb = cfg.k_packed_bytes
+        vpb = cfg.v_packed_bytes
+
+        # Group by impl (layer); every impl flushes the SAME block set and the
+        # slot index is shared across layers' pools, so per impl we collect
+        # (kvc, bids, slots).
+        by_impl: dict = {}
+        for impl, bid, kvc in flush_pairs:
+            slot = cls._block_to_slot_dict.get(bid)
+            if slot is None:
+                impl._tails.pop(bid, None)
+                continue
+            e = by_impl.get(id(impl))
+            if e is None:
+                e = [impl, kvc, [], []]
+                by_impl[id(impl)] = e
+            e[2].append(bid)
+            e[3].append(slot)
+            impl._tails.pop(bid, None)
+        if not by_impl:
+            return
+
+        # Block-chunk so one Sinkhorn launch stays bounded (~2k [R,C] tiles).
+        CHUNK_BLOCKS = max(1, 2048 // max(Hk, 1))
+        for impl, kvc, bids, slots in by_impl.values():
+            if kvc is None:
+                continue
+            dev = impl._tail_K_pool.device
+            for c0 in range(0, len(bids), CHUNK_BLOCKS):
+                bchunk = bids[c0:c0 + CHUNK_BLOCKS]
+                schunk = slots[c0:c0 + CHUNK_BLOCKS]
+                nB = len(bchunk)
+                M = nB * Hk
+                slot_t = torch.as_tensor(schunk, dtype=torch.long, device=dev)
+                bid_t = torch.as_tensor(bchunk, dtype=torch.long, device=dev)
+                # One gather per chunk (was nB tiny .float() ops).
+                K_rot = impl._tail_K_pool.index_select(0, slot_t).float()  # [nB,G,Hk,D]
+                V_rot = impl._tail_V_pool.index_select(0, slot_t).float()
+                # Tiles: K [M, D, G] (absorb=channel), V [M, G, D] (absorb=token).
+                K_tiles = K_rot.permute(0, 2, 3, 1).reshape(M, D, G)
+                V_tiles = V_rot.permute(0, 2, 1, 3).reshape(M, G, D)
+                # Same Sinkhorn + store as the legacy path (square 128x128 tile),
+                # so the packed bytes are identical.
+                all_tiles = torch.cat([K_tiles, V_tiles], dim=0)
+                all_bal, all_sc, all_sr = kvarn_sinkhorn_triton(
+                    all_tiles, iterations=cfg.sinkhorn_iters)
+                K_out = kvarn_store_tile_k_batch_from_sinkhorn(
+                    all_bal[:M], all_sc[:M], all_sr[:M], bits=cfg.key_bits)
+                V_out = kvarn_store_tile_v_batch_from_sinkhorn(
+                    all_bal[M:], all_sc[M:], all_sr[M:], bits=cfg.value_bits)
+                # Assemble the packed cache record [M, tile_bytes] by concatenating
+                # fields in config-offset order (fp16 scales byte-viewed to uint8),
+                # then pad to tile_bytes_aligned.
+                parts = [
+                    K_out["q_packed_uint8"].reshape(M, kpb),
+                    K_out["s_col_K"].contiguous().view(torch.uint8),
+                    K_out["zp_K"].contiguous().view(torch.uint8),
+                    K_out["s_row_K"].contiguous().view(torch.uint8),
+                    V_out["q_packed_uint8"].reshape(M, vpb),
+                    V_out["s_col_V"].contiguous().view(torch.uint8),
+                    V_out["s_row_V"].contiguous().view(torch.uint8),
+                    V_out["zp_V"].contiguous().view(torch.uint8),
+                ]
+                rec = torch.cat(parts, dim=1)                       # [M, tile_bytes]
+                if rec.shape[1] < T:
+                    rec = torch.nn.functional.pad(rec, (0, T - rec.shape[1]))
+                # One scatter per chunk (was nB*Hk _write_packed calls).
+                kvc[bid_t] = rec.view(nB, Hk, T)
+
+    @classmethod
+    def _batched_flush_legacy(cls, flush_pairs: list) -> None:
         """Flush many (impl, block_id, kv_cache) tiles via batched Sinkhorn + RTN.
 
         Replaces the per-(layer, block) Python loop calling `_flush_tail`. At
