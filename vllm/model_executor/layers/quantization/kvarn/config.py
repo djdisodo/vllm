@@ -262,6 +262,23 @@ class KVarNConfig:
         return slots * self._slot_bytes_per_layer(num_kv_heads) * max(num_layers, 1)
 
     @staticmethod
+    def num_kvarn_layers(model_config, parallel_config) -> int:
+        """Number of layers the KVarN fp16 tail pool actually spans = the
+        full-attention layers. On a hybrid model (Qwen3.5/3.6, Jamba, ...) the
+        Mamba/linear-attention layers have no KVarN pool, so sizing the pool by
+        ALL layers over-reserves it ~Nx and starves the Mamba/KV caches (OOM or
+        cap collapse). For a dense transformer this equals total layers, so the
+        dense path is unchanged. Falls back to total layers if the per-type
+        count is unavailable."""
+        try:
+            n = model_config.get_num_layers_by_block_type(parallel_config, "attention")
+            if n and n > 0:
+                return n
+        except Exception:
+            pass
+        return model_config.get_num_layers(parallel_config)
+
+    @staticmethod
     def estimate_weight_bytes(model: str, tensor_parallel_size: int = 1) -> int | None:
         """Best-effort per-rank model weight size in bytes, read from the
         checkpoint files on disk (exact, and cheap — no CUDA context, which the

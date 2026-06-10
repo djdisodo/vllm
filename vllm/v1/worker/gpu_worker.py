@@ -548,6 +548,45 @@ class Worker(WorkerBase):
             - cudagraph_memory_estimate_applied
         )
 
+        # KVarN's fp16 tail pool is allocated outside the paged KV cache, so
+        # reserve its memory here — otherwise num_gpu_blocks claims the whole KV
+        # budget and the (later, lazy) pool allocation pushes past the limit and
+        # OOMs (notably under TP, where small per-GPU weights leave a large KV
+        # budget). The pool is already bounded because check_and_update_config
+        # capped max_num_seqs to this budget, so the reservation is small. Sized
+        # per rank (per-rank kv heads) to match the actual allocation.
+        cache_dtype = self.cache_config.cache_dtype
+        # Dense-KVarN fp16 tail-pool reservation. Skip for MLA models: they route
+        # any kvarn_ dtype to the MLA latent path (its own pool), so this dense
+        # reservation must not run for them.
+        if (isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_")
+                and not cache_dtype.startswith("kvarn_mla")
+                and not getattr(self.vllm_config.model_config, "use_mla", False)):
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+
+            model_config = self.vllm_config.model_config
+            sched = self.vllm_config.scheduler_config
+            parallel_config = self.vllm_config.parallel_config
+            kvarn_cfg = KVarNConfig.from_cache_dtype(
+                cache_dtype, model_config.get_head_size()
+            )
+            # Pool spans only the full-attention layers KVarN quantizes, not the
+            # Mamba/linear-attention layers of a hybrid model — sizing by all
+            # layers would over-reserve it ~Nx on a hybrid. Dense path unchanged.
+            pool_bytes = kvarn_cfg.pool_bytes(
+                max_num_seqs=sched.max_num_seqs,
+                max_num_batched_tokens=sched.max_num_batched_tokens,
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                num_layers=KVarNConfig.num_kvarn_layers(model_config, parallel_config),
+            )
+            self.available_kv_cache_memory_bytes -= pool_bytes
+            logger.info_once(
+                "Reserved %s GiB for the KVarN fp16 tail pool.",
+                format_gib(pool_bytes),
+            )
+
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
