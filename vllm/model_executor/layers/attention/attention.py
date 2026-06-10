@@ -420,6 +420,13 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_sharing_target_layer_name,
             **extra_impl_args,
         )
+        # Expose the layer name on the impl so backends that scope per-layer /
+        # per-KV-cache-group state (e.g. KVarN's slot allocator) can identify
+        # which group an impl belongs to by matching the builder's layer_names.
+        try:
+            self.impl.layer_name = prefix
+        except Exception:
+            pass
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
@@ -611,6 +618,29 @@ class Attention(nn.Module, AttentionLayerBase):
             assert not self.attn_backend.is_mla(), (
                 "MLA is not supported for sliding window"
             )
+            if (
+                self.kv_cache_dtype.startswith("kvarn_")
+                and not self.kv_cache_dtype.startswith("kvarn_mla")
+            ):
+                from vllm.model_executor.layers.quantization.kvarn.config import (
+                    KVarNConfig,
+                )
+                from vllm.v1.kv_cache_interface import TQSlidingWindowSpec
+
+                kvarn_cfg = KVarNConfig.from_cache_dtype(
+                    self.kv_cache_dtype, self.head_size
+                )
+                slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
+                return TQSlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size,
+                    dtype=self.kv_cache_torch_dtype,
+                    sliding_window=self.sliding_window,
+                    tq_slot_size=slot_bytes,
+                )
+
             # SW chooses its own block_size, decoupled from the user's
             # ``--block-size`` (which only constrains primary attention).
             # When this SW layer is a padded spec (skip-quant: its page is

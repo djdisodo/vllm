@@ -158,6 +158,21 @@ def kvarn_sinkhorn_triton(
     tiles = tiles.contiguous().to(torch.float32)
     device = tiles.device
 
+    # The Triton kernel loads the WHOLE [R, C] tile into one program's registers
+    # and unrolls the iteration loop. At large head_dim that tile is huge (e.g.
+    # head_dim 512 -> [512, 128] = 256 KB) and the Triton compiler hangs/explodes
+    # (128/256 compile fine). Route large tiles to the batched PyTorch Sinkhorn
+    # (identical algorithm). Flush is infrequent + off the decode hot path, so the
+    # cost is fine; head_dim<=256 keeps the fast kernel.
+    if max(R, C) > 256:
+        from vllm.model_executor.layers.quantization.kvarn.sinkhorn import (
+            variance_normalize_batched,
+        )
+        bal, s_col_b, s_row_b = variance_normalize_batched(tiles, iterations=iterations)
+        return (bal.contiguous(),
+                s_col_b.reshape(N, C).contiguous(),
+                s_row_b.reshape(N, R).contiguous())
+
     balanced = torch.empty(N, R, C, dtype=torch.float32, device=device)
     s_col = torch.empty(N, C, dtype=torch.float32, device=device)
     s_row = torch.empty(N, R, dtype=torch.float32, device=device)

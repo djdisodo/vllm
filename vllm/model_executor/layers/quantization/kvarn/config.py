@@ -17,6 +17,7 @@ from dataclasses import dataclass
 # the shipped preset spends more bits on keys than values.
 KVARN_PRESETS: dict[str, dict] = {
     "kvarn_k4v2_g128": {"key_bits": 4, "value_bits": 2, "group": 128},
+    "kvarn_k4v4_g128": {"key_bits": 4, "value_bits": 4, "group": 128},
 }
 
 
@@ -55,7 +56,7 @@ class KVarNConfig:
     key_bits: int = 4
     value_bits: int = 4
     group: int = 128
-    sinkhorn_iters: int = 8         # converges by ~4 iters; 8 lossless vs 16 (see from_cache_dtype)
+    sinkhorn_iters: int = 8         # converges by ~4 iters; 8 lossless vs 16 (validated Qwen3-4B + Qwen3.6-27B AIME)
     sink_tokens: int = 128          # first N tokens per request stay fp16 (NEVER quantised)
     boundary_skip_layers: int = 0   # layer-level skipping off by default; sink_tokens replaces it
 
@@ -102,7 +103,21 @@ class KVarNConfig:
 
     @property
     def tile_bytes_aligned(self) -> int:
-        """tile_bytes rounded up to multiple of 8 for nicer Triton loads."""
+        """tile_bytes rounded up for nicer Triton loads.
+
+        For head_dim >= 256 we round the PER-TOKEN slot (tile_bytes / group) up to
+        a power of 2. This is required for models with heterogeneous head_dim
+        (e.g. Gemma-4: 256 sliding-window layers + 512 global layers): the raw
+        slot has a fixed per-token-group scale term that doesn't scale with D, so
+        slot(512)/slot(256) is not an integer and vLLM's KV-cache page-size
+        unification (which scales block_size by that ratio) fails. Power-of-2 slots
+        make the ratio an exact power of 2. head_dim<=128 keeps the tight 8-byte
+        alignment (the common case; no padding). Trailing pad only — offsets are
+        unchanged, so the layout/kernels are byte-compatible."""
+        if self.head_dim >= 256:
+            slot = math.ceil(self.tile_bytes / self.group)
+            slot_pow2 = 1 << (slot - 1).bit_length()
+            return slot_pow2 * self.group
         return ((self.tile_bytes + 7) // 8) * 8
 
     # ── slot byte offsets within one tile (used by the kernels) ──────────────
@@ -148,19 +163,18 @@ class KVarNConfig:
     # values or exhaust if under-sized), we pick a memory budget and cap the
     # scheduler's concurrency to what that budget supports — see
     # `max_supported_seqs` and the platform's check_and_update_config.
-    #
     # The pool and the paged KV cache draw from the SAME pot: the memory left
-    # after weights (`gpu_memory_utilization · total − weights`). Sizing the pool
-    # as a fixed fraction of *total* GPU memory strangled concurrency on common
-    # setups (issue #15: a 4B on a 24GB card capped to ~30 seqs while the KV cache
-    # sat at ~3% — ~10GB of usable memory wasted). We instead give the pool a
-    # share of the post-weight usable envelope (POOL_USABLE_SHARE), which
-    # auto-scales: a small model on a big card gets a large pool / high
-    # concurrency, a model that nearly fills the card gets a small one (degrades
-    # to cap≈1, never OOMs). The legacy fraction-of-total path is kept as a
-    # fallback for when the weight size can't be read. Both tunable via
-    # KVARN_POOL_MEM_FRAC (share-of-usable when weights are known, else
-    # fraction-of-total).
+    # after model weights (i.e. `gpu_memory_utilization · total − weights`).
+    # Sizing the pool as a fixed fraction of *total* GPU memory was the bug
+    # behind issue #15: on a 4B/24GB card the pool got 0.08·24≈1.9 GB and
+    # concurrency capped to ~30 while the KV cache sat at ~3% utilization —
+    # ~10 GB of usable memory wasted. We instead give the pool a share of the
+    # post-weight usable envelope (POOL_USABLE_SHARE), which auto-scales: a small
+    # model on a big card gets a large pool (high concurrency), a model that
+    # nearly fills the card gets a small one (degrades to cap≈1, never OOMs).
+    # The legacy fraction-of-total path is kept as a fallback for when the weight
+    # size can't be read. Both are tunable via KVARN_POOL_MEM_FRAC (interpreted
+    # as share-of-usable when weights are known, else fraction-of-total).
     POOL_MEM_FRAC_DEFAULT = 0.08          # legacy: fraction of TOTAL (fallback)
     POOL_USABLE_SHARE_DEFAULT = 0.5       # share of (util·total − weights)
 
@@ -175,7 +189,11 @@ class KVarNConfig:
         full blocks a chunked prefill can touch before flushing, plus headroom.
         With concurrency capped (see max_supported_seqs) this fits the budget."""
         prefill_blocks = (max_num_batched_tokens + self.group - 1) // self.group
-        return max(2 * max_num_seqs + prefill_blocks + 32, 64)
+        # Floor/headroom kept small: at large head_dim·heads·layers (e.g. Gemma-4
+        # 512·16·60 => ~251 MB/slot/layer) a big floor like 64 reserves tens of GB
+        # and leaves no room for the KV cache. The real peak is sink+tail per seq
+        # (2·S) plus the blocks an in-flight prefill touches before it flushes.
+        return max(2 * max_num_seqs + prefill_blocks + 8, 8)
 
     def pool_budget_bytes(
         self,
@@ -186,15 +204,15 @@ class KVarNConfig:
         """GPU bytes the fp16 tail pool is allowed to occupy.
 
         Preferred (weight-aware): a share of the post-weight usable envelope,
-        ``share · (gpu_memory_utilization · total − weight_bytes)`` — the memory
-        the pool and the paged KV cache actually compete for, so the budget
-        tracks real headroom instead of an arbitrary slice of the whole card
-        (issue #15). ``share`` comes from KVARN_POOL_MEM_FRAC or
+        ``share · (gpu_memory_utilization · total − weight_bytes)``. This is the
+        memory the pool and the paged KV cache actually compete for, so the
+        budget tracks real headroom instead of an arbitrary slice of the whole
+        card (issue #15). ``share`` comes from KVARN_POOL_MEM_FRAC or
         POOL_USABLE_SHARE_DEFAULT.
 
         Fallback (weights unknown): the legacy ``frac · total`` with
-        POOL_MEM_FRAC_DEFAULT, so behaviour is unchanged when the weight size
-        cannot be read."""
+        POOL_MEM_FRAC_DEFAULT, so behaviour is unchanged when we cannot read the
+        weight size."""
         env = os.environ.get("KVARN_POOL_MEM_FRAC")
         if weight_bytes is not None and gpu_memory_utilization is not None:
             share = float(env) if env is not None else self.POOL_USABLE_SHARE_DEFAULT
@@ -216,7 +234,7 @@ class KVarNConfig:
         """Largest max_num_seqs whose pool fits the pool budget.
 
         Inverts `pool_slots`: max_slots = budget / (slot_bytes · layers), then
-        solve 2·S + prefill + 32 ≤ max_slots for S. Always ≥ 1. The budget is
+        solve 2·S + prefill + 8 ≤ max_slots for S. Always ≥ 1. The budget is
         weight-aware when `weight_bytes`/`gpu_memory_utilization` are supplied
         (see `pool_budget_bytes`); `frac`, if given, forces the legacy
         fraction-of-total path."""
@@ -228,7 +246,7 @@ class KVarNConfig:
         slot_bytes = self._slot_bytes_per_layer(num_kv_heads) * max(num_layers, 1)
         max_slots = int(budget / slot_bytes)
         prefill_blocks = (max_num_batched_tokens + self.group - 1) // self.group
-        return max(1, (max_slots - prefill_blocks - 32) // 2)
+        return max(1, (max_slots - prefill_blocks - 8) // 2)
 
     def pool_bytes(
         self,
@@ -258,6 +276,7 @@ class KVarNConfig:
         try:
             d = model
             if not os.path.isdir(d):
+                # Repo id → resolve the already-cached snapshot, if any.
                 try:
                     from huggingface_hub import snapshot_download
                     d = snapshot_download(model, local_files_only=True)
@@ -296,13 +315,9 @@ class KVarNConfig:
                 f"Unknown KVarN cache dtype: {cache_dtype!r}. Valid: {valid}"
             )
         preset = KVARN_PRESETS[cache_dtype]
-        # Sinkhorn iteration count (KVARN_SINKHORN_ITERS to override). Default 8:
-        # the variance-normalization converges in practice by ~4 iters and the
-        # kernel keeps the best-so-far scales, so 8 is lossless vs 16 (validated
-        # token-identical on Qwen3-4B / AIME25, fp16) while roughly halving the
-        # flush kernel's cost — the dominant KVarN-specific decode-GPU overhead
-        # at burst (issue #15). Raise it for large reasoning models if a
-        # convergence check shows benefit (e.g. 48-layer 30B-A3B-Thinking-2507).
+        # Optional env override for Sinkhorn iteration count (KVARN_SINKHORN_ITERS).
+        # Default 16 mirrors the paper; useful for testing convergence at large
+        # model scale (e.g. 48-layer 30B-A3B-Thinking-2507 may benefit from more).
         iters = int(os.environ.get("KVARN_SINKHORN_ITERS", "8"))
         sink_tokens = int(os.environ.get("KVARN_SINK_TOKENS", "128"))
         return KVarNConfig(
