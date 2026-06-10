@@ -31,6 +31,8 @@ CacheDType = Literal[
     "turboquant_3bit_nc",
     "kvarn_k4v2_g128",
     "kvarn_k4v4_g128",
+    "kvarn_k4v2_g64",
+    "kvarn_k4v4_g64",
     "kvarn_mla_k4_g128",
     "int4_per_token_head",
     "int8_per_token_head",

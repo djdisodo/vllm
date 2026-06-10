@@ -8,16 +8,21 @@ from dataclasses import dataclass
 
 # Named KVarN presets: each maps to a frozen set of config parameters.
 # The trailing g<N> encodes the variance-normalization tile size, which must
-# equal the vLLM block size. g128 is the current design point.
+# equal the vLLM block size. g128 is the current design point; g64 trades a
+# little compression (more per-tile scale overhead per token) for finer
+# quantization granularity (each tile's scales adapt to fewer tokens).
 #
 # Bit-width is fully parameterized in the quantizer and kernels (key_bits /
-# value_bits), so additional presets are a one-line addition here. Keys carry
-# more quantization sensitivity than values (key error propagates through the
-# softmax exponentials, value error is averaged out by the softmax weights), so
-# the shipped preset spends more bits on keys than values.
+# value_bits), and the tile size flows through cfg.group everywhere (storage
+# layout, Triton GROUP constexpr, flush / slot math), so additional presets are
+# a one-line addition here. Keys carry more quantization sensitivity than values
+# (key error propagates through the softmax exponentials, value error is averaged
+# out by the softmax weights), so the shipped preset spends more bits on keys.
 KVARN_PRESETS: dict[str, dict] = {
     "kvarn_k4v2_g128": {"key_bits": 4, "value_bits": 2, "group": 128},
     "kvarn_k4v4_g128": {"key_bits": 4, "value_bits": 4, "group": 128},
+    "kvarn_k4v2_g64": {"key_bits": 4, "value_bits": 2, "group": 64},
+    "kvarn_k4v4_g64": {"key_bits": 4, "value_bits": 4, "group": 64},
 }
 
 
