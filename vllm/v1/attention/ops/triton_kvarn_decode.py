@@ -31,7 +31,29 @@ from vllm.triton_utils import tl, triton
 # Number of KV-sequence splits for the split-K flash-decoding kernel. More
 # splits = better load-balancing of ragged burst seqlens across SMs, at the cost
 # of a larger fp32 partial-output scratch + more stage-2 combine work.
-KVARN_NUM_KV_SPLITS = 8
+KVARN_NUM_KV_SPLITS = int(os.environ.get("KVARN_NUM_KV_SPLITS", "16"))
+KVARN_MAX_KV_SPLITS = 64  # cap of the context-adaptive schedule below
+
+
+def adaptive_num_kv_splits(max_blocks_per_req: int) -> int:
+    """Context-adaptive split-K count (single source of truth for the decode
+    driver AND the partial-buffer sizing, so they can never diverge).
+
+    Depends only on the deployment's max_model_len (via max_blocks_per_req =
+    ceil(max_model_len/group)), so it is CONSTANT per deployment -> CUDA-graph
+    safe and changes nothing for short-context deployments. The fixed 16
+    under-parallelized the stage-1 grid at long context + low batch (Qwen3.6-27B
+    burst@16K: 0.75x bf16 at 16 vs 1.10x at 32). KVARN_NUM_KV_SPLITS overrides.
+    Split-K is log-sum-exp-combined, so the count never changes the OUTPUT, only
+    occupancy: <=80 blocks (~<=10K ctx) keeps the tuned 16, longer bumps up."""
+    env = os.environ.get("KVARN_NUM_KV_SPLITS")
+    if env is not None:
+        return int(env)
+    if max_blocks_per_req <= 80:
+        return 16
+    if max_blocks_per_req <= 256:
+        return 32
+    return KVARN_MAX_KV_SPLITS
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -461,6 +483,8 @@ def _kvarn_fused_decode_kernel(
     GROUP: tl.constexpr,
     BLOCK_N: tl.constexpr,
     Q_PER_KV: tl.constexpr,
+    Q_PER_KV_PAD: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
     K_BITS: tl.constexpr,
     V_BITS: tl.constexpr,
     NUM_BLOCKS_LOOKUP: tl.constexpr,
@@ -477,9 +501,13 @@ def _kvarn_fused_decode_kernel(
     # query heads that share this KV head, so each int4 K/V tile is dequantized
     # ONCE (not Q_PER_KV times). The redundant-dequant penalty of the per-Q-head
     # version scales with Q_PER_KV (4× on Qwen3-4B) and was the dominant cost.
+    # Q_PER_KV is padded to a power of 2 (Q_PER_KV_PAD) because tl.arange / tl.dot
+    # require pow2 dims; padded query heads are masked off (e.g. Qwen3.5 GQA 24/4
+    # = ratio 6 -> pad to 8).
     b = tl.program_id(0)
     hk = tl.program_id(1)
-    qh = tl.arange(0, Q_PER_KV)                            # query heads in this group
+    qh = tl.arange(0, Q_PER_KV_PAD)                        # padded query-head lane
+    qmask = qh < Q_PER_KV                                  # real heads in this group
     hq0 = hk * Q_PER_KV
 
     seq_len = tl.load(Seq_lens_ptr + b)
@@ -492,16 +520,24 @@ def _kvarn_fused_decode_kernel(
     d_byte_v = d_offs // PACK_V
     d_shift_v = (d_offs % PACK_V) * V_BITS
 
-    # q: [Q_PER_KV, D]
+    # q: [Q_PER_KV_PAD, D] — padded lanes masked to 0 (no OOB read past Hq).
     q = tl.load(Q_ptr + b * stride_q_b + (hq0 + qh)[:, None] * stride_q_h
-                + d_offs[None, :]).to(tl.float32)
+                + d_offs[None, :], mask=qmask[:, None], other=0.0).to(tl.float32)
 
-    m_i = tl.full([Q_PER_KV], -float("inf"), dtype=tl.float32)
-    l_i = tl.zeros([Q_PER_KV], dtype=tl.float32)
-    acc = tl.zeros([Q_PER_KV, D], dtype=tl.float32)
+    m_i = tl.full([Q_PER_KV_PAD], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([Q_PER_KV_PAD], dtype=tl.float32)
+    acc = tl.zeros([Q_PER_KV_PAD, D], dtype=tl.float32)
 
     n_blocks = (seq_len + GROUP - 1) // GROUP
-    for k in range(0, n_blocks):
+    # Sliding-window: this query (last token) only attends to the last
+    # SLIDING_WINDOW keys, so start the block loop at the first block that
+    # overlaps the window (massive saving: ~window/GROUP blocks instead of all).
+    win_start = 0
+    blk_lo = 0
+    if SLIDING_WINDOW > 0:
+        win_start = tl.maximum(seq_len - SLIDING_WINDOW, 0)
+        blk_lo = win_start // GROUP
+    for k in range(blk_lo, n_blocks):
         rem = seq_len - k * GROUP
         n_tok = tl.minimum(tl.maximum(rem, 0), GROUP)
 
@@ -529,6 +565,8 @@ def _kvarn_fused_decode_kernel(
         for c0 in range(0, GROUP, BLOCK_N):
             cols = c0 + tl.arange(0, BLOCK_N)              # [BN] token indices in tile
             cmask = cols < n_tok
+            if SLIDING_WINDOW > 0:                          # mask keys before the window boundary
+                cmask = cmask & ((k * GROUP + cols) >= win_start)
 
             if pool_slot >= 0:
                 # fp16 already-rotated tokens in the pool (sink / partial tail).
@@ -571,8 +609,9 @@ def _kvarn_fused_decode_kernel(
             acc = acc * alpha[:, None] + tl.dot(p, Vc)                                 # [Q_PER_KV, D]
             m_i = m_new
 
-    out = (acc / l_i[:, None]).to(tl.float16)                                          # [Q_PER_KV, D]
-    tl.store(Out_ptr + b * stride_o_b + (hq0 + qh)[:, None] * stride_o_h + d_offs[None, :], out)
+    out = (acc / l_i[:, None]).to(tl.float16)                                          # [Q_PER_KV_PAD, D]
+    tl.store(Out_ptr + b * stride_o_b + (hq0 + qh)[:, None] * stride_o_h + d_offs[None, :],
+             out, mask=qmask[:, None])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -600,6 +639,7 @@ def _kvarn_fused_decode_stage1(
     MAX_BLOCKS_PER_REQ: tl.constexpr, D: tl.constexpr, GROUP: tl.constexpr,
     BLOCK_N: tl.constexpr, Q_PER_KV: tl.constexpr, NUM_KV_SPLITS: tl.constexpr,
     HQ: tl.constexpr, K_BITS: tl.constexpr, V_BITS: tl.constexpr,
+    Q_PER_KV_PAD: tl.constexpr, SLIDING_WINDOW: tl.constexpr,
     NUM_BLOCKS_LOOKUP: tl.constexpr,
     K_PACKED_OFFSET: tl.constexpr, K_S_COL_OFFSET: tl.constexpr,
     K_ZP_OFFSET: tl.constexpr, K_S_ROW_OFFSET: tl.constexpr,
@@ -609,7 +649,8 @@ def _kvarn_fused_decode_stage1(
     b = tl.program_id(0)
     hk = tl.program_id(1)
     split = tl.program_id(2)
-    qh = tl.arange(0, Q_PER_KV)
+    qh = tl.arange(0, Q_PER_KV_PAD)                        # padded to pow2; mask below
+    qmask = qh < Q_PER_KV
     hq0 = hk * Q_PER_KV
 
     seq_len = tl.load(Seq_lens_ptr + b)
@@ -626,11 +667,11 @@ def _kvarn_fused_decode_stage1(
     d_byte_v = d_offs // PACK_V
     d_shift_v = (d_offs % PACK_V) * V_BITS
     q = tl.load(Q_ptr + b * stride_q_b + (hq0 + qh)[:, None] * stride_q_h
-                + d_offs[None, :]).to(tl.float32)
+                + d_offs[None, :], mask=qmask[:, None], other=0.0).to(tl.float32)
 
-    m_i = tl.full([Q_PER_KV], -float("inf"), dtype=tl.float32)
-    l_i = tl.zeros([Q_PER_KV], dtype=tl.float32)
-    acc = tl.zeros([Q_PER_KV, D], dtype=tl.float32)
+    m_i = tl.full([Q_PER_KV_PAD], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([Q_PER_KV_PAD], dtype=tl.float32)
+    acc = tl.zeros([Q_PER_KV_PAD, D], dtype=tl.float32)
 
     for k in range(blk_lo, blk_hi):
         rem = seq_len - k * GROUP
@@ -656,6 +697,8 @@ def _kvarn_fused_decode_stage1(
         for c0 in range(0, GROUP, BLOCK_N):
             cols = c0 + tl.arange(0, BLOCK_N)
             cmask = cols < n_tok
+            if SLIDING_WINDOW > 0:
+                cmask = cmask & ((k * GROUP + cols) >= tl.maximum(seq_len - SLIDING_WINDOW, 0))
             if pool_slot >= 0:
                 src = pool_base + cols[:, None] * stride_pool_t + d_offs[None, :]
                 Kc = tl.load(Tail_K_pool_ptr + src, mask=cmask[:, None], other=0.0).to(tl.float32)
@@ -667,7 +710,7 @@ def _kvarn_fused_decode_stage1(
                 srk_lo = tl.load(KV_cache_ptr + tile_base + K_S_ROW_OFFSET + cols * 2).to(tl.uint16)
                 srk_hi = tl.load(KV_cache_ptr + tile_base + K_S_ROW_OFFSET + cols * 2 + 1).to(tl.uint16)
                 s_row_K = ((srk_lo | (srk_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
-                k_addrs = (tile_base + K_PACKED_OFFSET + d_offs[:, None] * (GROUP // 2) + cb_k[None, :])
+                k_addrs = (tile_base + K_PACKED_OFFSET + d_offs[:, None] * (GROUP // PACK_K) + cb_k[None, :])
                 k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
                 q_K = ((k_bytes >> cs_k[None, :]) & MASK_K).to(tl.float32)
                 K_dg = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]
@@ -677,7 +720,12 @@ def _kvarn_fused_decode_stage1(
                 zpv_lo = tl.load(KV_cache_ptr + tile_base + V_ZP_OFFSET + cols * 2).to(tl.uint16)
                 zpv_hi = tl.load(KV_cache_ptr + tile_base + V_ZP_OFFSET + cols * 2 + 1).to(tl.uint16)
                 zp_V = ((zpv_lo | (zpv_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
-                v_addrs = (tile_base + V_PACKED_OFFSET + cols[:, None] * (D // 2) + d_byte_v[None, :])
+                # FIX: V packed-row stride is D/PACK_V bytes (PACK_V = 8/V_BITS).
+                # Was hardcoded `D // 2` (correct only for 4-bit V); with the shipped
+                # k4v2 preset (V_BITS=2 -> PACK_V=4) it strode 2x too far -> read
+                # garbage V + indexed past the tile (OOB illegal-access at long ctx).
+                # The single-stage kernel already used (D // PACK_V); this matches it.
+                v_addrs = (tile_base + V_PACKED_OFFSET + cols[:, None] * (D // PACK_V) + d_byte_v[None, :])
                 v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
                 q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
                 Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]
@@ -695,9 +743,10 @@ def _kvarn_fused_decode_stage1(
     nonempty = l_i > 0
     O_s = acc / tl.where(nonempty, l_i, 1.0)[:, None]                  # [Q_PER_KV, D]
     lse_s = tl.where(nonempty, m_i + tl.log(tl.where(nonempty, l_i, 1.0)), -float("inf"))
-    rows = b * HQ + hq0 + qh                                          # [Q_PER_KV] (= N rows)
-    tl.store(MidO_ptr + rows[:, None] * stride_mo_n + split * stride_mo_s + d_offs[None, :], O_s)
-    tl.store(MidLse_ptr + rows * stride_ml_n + split, lse_s)
+    rows = b * HQ + hq0 + qh                                          # [Q_PER_KV_PAD] (= N rows)
+    tl.store(MidO_ptr + rows[:, None] * stride_mo_n + split * stride_mo_s + d_offs[None, :], O_s,
+             mask=qmask[:, None])
+    tl.store(MidLse_ptr + rows * stride_ml_n + split, lse_s, mask=qmask)
 
 
 @triton.jit
@@ -789,9 +838,15 @@ def kvarn_decode_attention(
     _bn = int(os.environ.get("KVARN_BLOCK_N", "16"))
     _nw = int(os.environ.get("KVARN_NUM_WARPS", "4"))
     _ns = int(os.environ.get("KVARN_NUM_STAGES", "2"))
+    _qpk = Hq // Hk
+    # Pad Q_PER_KV to a power of 2 for tl.arange / tl.dot (e.g. Qwen3.5 GQA
+    # 24q/4kv = ratio 6 -> 8); padded query heads are masked off in-kernel.
+    _qpk_pad = 1 << (_qpk - 1).bit_length() if _qpk > 1 else 1
     common = dict(
         MAX_BLOCKS_PER_REQ=max_blocks_per_req, D=D, GROUP=group,
-        Q_PER_KV=Hq // Hk, K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
+        Q_PER_KV=_qpk, Q_PER_KV_PAD=_qpk_pad,
+        SLIDING_WINDOW=int(getattr(impl, "sliding_window", 0) or 0),
+        K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
         NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
         K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
         K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
@@ -804,7 +859,26 @@ def kvarn_decode_attention(
     # already saturates the GPU, so split-K's mid-buffer round-trip + stage-2 +
     # empty-split waste roughly HALVE throughput. Default: single-stage.
     use_fused = use_fused and True
-    split_k = use_fused and os.environ.get("KVARN_SPLIT_K", "0") == "1"
+    # Split-K decision. Single-stage grid is (B, Hk) programs, each serially
+    # walking the WHOLE context; at long context that serial loop dominates and
+    # leaves the GPU under-occupied -> split-K parallelizes the KV dim for a big
+    # win (Qwen3.5-27B head_dim256 16K: 0.59x -> 0.96x same-batch, and lets KVarN
+    # out-throughput FP16's max feasible batch). But at short context / high
+    # occupancy the mid-buffer round-trip + stage-2 + empty-split waste roughly
+    # HALVE throughput. So auto-enable only in the long-context, under-occupied
+    # regime; KVARN_SPLIT_K env (0/1) is an explicit override.
+    _sk_env = os.environ.get("KVARN_SPLIT_K")
+    if _sk_env is not None:
+        split_k = use_fused and _sk_env == "1"
+    else:
+        sm_count = getattr(impl, "_sm_count", 0) or torch.cuda.get_device_properties(
+            device).multi_processor_count
+        # long context (>= ~16 blocks of group tokens) AND single-stage grid does
+        # not already fill the SMs.
+        # Sliding-window layers read only ~window/GROUP blocks (single-stage is
+        # plenty + the windowed loop is in the single-stage kernel), so never split.
+        _sw = int(getattr(impl, "sliding_window", 0) or 0)
+        split_k = use_fused and (_sw <= 0) and (max_blocks_per_req >= 16) and (B * Hk <= sm_count)
     if use_fused and not split_k:
         fused_out = impl._fused_out_buf[:N]               # [N, D] fp16
         with torch.profiler.record_function("kvarn_fused_decode"):
@@ -818,7 +892,7 @@ def kvarn_decode_attention(
             )
         output_rot = fused_out
     elif split_k:
-        SPLITS = KVARN_NUM_KV_SPLITS
+        SPLITS = adaptive_num_kv_splits(max_blocks_per_req)
         mid_o = impl._mid_o_buf
         mid_lse = impl._mid_lse_buf
         fused_out = impl._fused_out_buf[:N]

@@ -94,6 +94,35 @@ def _build_hadamard(d: int, device: torch.device) -> torch.Tensor:
     return _hadamard_cached(d, str(torch.device(device)))
 
 
+def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg):
+    """Sinkhorn-balance + pack a batch of K and V tiles into int4 stores.
+
+    K_tiles is [N, D, group] (absorb axis = channel), V_tiles is [N, group, D]
+    (absorb axis = token). When D == group (head_dim 128) the two have the same
+    [R, C] shape, so we fuse them into ONE Triton Sinkhorn launch. When D != group
+    (e.g. head_dim 256, group 128) the tiles are non-square and have different
+    [R, C] — kvarn_sinkhorn_triton takes R, C as per-launch constexpr — so K and V
+    must be balanced in SEPARATE launches. (A single torch.cat here assumed square
+    and broke at head_dim=256.)"""
+    if K_tiles.shape[1:] == V_tiles.shape[1:]:
+        nk = K_tiles.shape[0]
+        bal, sc, sr = kvarn_sinkhorn_triton(
+            torch.cat([K_tiles, V_tiles], dim=0), iterations=cfg.sinkhorn_iters,
+        )
+        K_out = kvarn_store_tile_k_batch_from_sinkhorn(
+            bal[:nk], sc[:nk], sr[:nk], bits=cfg.key_bits)
+        V_out = kvarn_store_tile_v_batch_from_sinkhorn(
+            bal[nk:], sc[nk:], sr[nk:], bits=cfg.value_bits)
+    else:
+        kbal, ksc, ksr = kvarn_sinkhorn_triton(K_tiles, iterations=cfg.sinkhorn_iters)
+        vbal, vsc, vsr = kvarn_sinkhorn_triton(V_tiles, iterations=cfg.sinkhorn_iters)
+        K_out = kvarn_store_tile_k_batch_from_sinkhorn(
+            kbal, ksc, ksr, bits=cfg.key_bits)
+        V_out = kvarn_store_tile_v_batch_from_sinkhorn(
+            vbal, vsc, vsr, bits=cfg.value_bits)
+    return K_out, V_out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Backend metadata classes
 # ──────────────────────────────────────────────────────────────────────────────
@@ -175,7 +204,14 @@ class KVarNAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return head_size == 128
+        return head_size in (128, 256, 512)
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # Multimodal models (e.g. Gemma-4) set use_mm_prefix; text generation
+        # never materializes mm tokens so KVarN decode is unaffected. (Image/audio
+        # prefix full-attention correctness is unverified — text-only validated.)
+        return True
 
 
 @dataclass
@@ -221,6 +257,17 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
+        # KV-cache-group key, must match KVarNAttentionImpl._group_key for this
+        # group's layers so the builder mutates the right group's slot allocator.
+        # (head_size, num_kv_heads, sliding_window) — see impl._group_key.
+        # TRUE per-group identity = this builder's exact layer set. A config
+        # proxy (head,kv,sw) is NOT enough: vLLM splits same-config layers into
+        # multiple groups (Gemma-4's repeating pattern -> 5 sliding groups all
+        # head256/16kv/1024), each with its own block_id space. The builder tags
+        # its impls with this key in build() (impls don't reliably carry a name).
+        self._layer_names = list(layer_names)
+        self._layer_names_set = set(self._layer_names)
+        self._group_key = tuple(sorted(self._layer_names))
         # Stage α-2: per-request fill tracking for flush detection, keyed by
         # the sink block id so request identity survives batch reordering.
         #   _prev_seq_len_by_sink[sink]  = seq_len at the previous step
@@ -254,9 +301,19 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         )
         # Pre-materialise CPU views ONCE per batch. Every layer's forward()
         # would otherwise re-issue these syncs (28+ syncs/token for Qwen3-0.6B).
-        seq_lens_cpu = cam.seq_lens.tolist()
-        block_table_cpu = cam.block_table_tensor.tolist()
+        # Use the framework's cached CPU copy of seq_lens (cam.seq_lens_cpu) to
+        # avoid an extra GPU->CPU sync per step (issue #15 build-overhead).
+        _slc = getattr(cam, "seq_lens_cpu", None)
+        seq_lens_cpu = (_slc.tolist() if _slc is not None else cam.seq_lens.tolist())
+        # block_table as a numpy 2-D array (C-backed, lazy element access) rather
+        # than .tolist(): the full B×max_blocks nested-list build was ~7 ms/step
+        # at B=256 and dominated build() once the flush was vectorized (issue #15).
+        # We only touch column 0 (sinks) + a few per-request entries, so numpy's
+        # O(1) indexing avoids materializing ~8k Python ints every step.
+        block_table_np = cam.block_table_tensor.cpu().numpy()
         slot_mapping_cpu = cam.slot_mapping.tolist()
+        bt_rows = block_table_np.shape[0]
+        bt_cols = block_table_np.shape[1] if block_table_np.ndim == 2 else 0
         device = cam.seq_lens.device
 
         # ── Stage α-2: capture-correct metadata ──────────────────────────
@@ -300,29 +357,43 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # request leaks its sink (and partial-tail) slot until the pool drains.
         blocks_needed: set[int] = set()
         for b in range(B):
-            row = block_table_cpu[b] if b < len(block_table_cpu) else []
+            if b >= bt_rows:
+                break
             sl = seq_lens_cpu[b]
-            if not row or sl <= 0:
+            if bt_cols == 0 or sl <= 0:
                 continue
-            if row[0] >= 0:
-                blocks_needed.add(row[0])          # sink (kept fp16 forever)
+            row = block_table_np[b]
+            s0 = int(row[0])
+            if s0 >= 0:
+                blocks_needed.add(s0)              # sink (kept fp16 forever)
             tail_idx = sl // GROUP                  # in-progress tail block
-            if tail_idx < len(row) and row[tail_idx] >= 0:
-                blocks_needed.add(row[tail_idx])
+            if tail_idx < bt_cols:
+                bt = int(row[tail_idx])
+                if bt >= 0:
+                    blocks_needed.add(bt)
         for s in slot_mapping_cpu:                 # in-progress tail(s) / prefill
             if s >= 0:
                 blocks_needed.add(s // GROUP)
 
-        if KVarNAttentionImpl._all_impls:
-            impl0 = KVarNAttentionImpl._all_impls[0]
+        gk = self._group_key
+        # Claim THIS group's impls by layer name (set on the impl in
+        # Attention.__init__) and tag them with the true group key, so their
+        # _ensure_pool / store paths use this group's slot allocator + mirror.
+        group_impls = [i for i in KVarNAttentionImpl._all_impls
+                       if getattr(i, "layer_name", None) in self._layer_names_set]
+        for i in group_impls:
+            i._group_key = gk
+        if group_impls:
+            impl0 = group_impls[0]
             # Ensure pool + lookup tensors exist for this device.
             impl0._ensure_pool(device,
                 num_blocks_hint=max(blocks_needed, default=0) + 1)
-            b2s_t = KVarNAttentionImpl._block_to_slot_t_per_device[device]
-            is_sink_t = KVarNAttentionImpl._is_sink_t_per_device[device]
-            dict_map = KVarNAttentionImpl._block_to_slot_dict
-            free_slots = KVarNAttentionImpl._free_slots
-            sinks = KVarNAttentionImpl._global_sink_blocks
+            mkey = (device, gk)
+            b2s_t = KVarNAttentionImpl._block_to_slot_t_per_device[mkey]
+            is_sink_t = KVarNAttentionImpl._is_sink_t_per_device[mkey]
+            dict_map = KVarNAttentionImpl._block_to_slot_dict[gk]
+            free_slots = KVarNAttentionImpl._free_slots[gk]
+            sinks = KVarNAttentionImpl._global_sink_blocks[gk]
 
             # ORDER MATTERS: mark sinks → FLUSH (frees just-completed blocks'
             # slots) → ALLOCATE (the new tails, reusing the freed slots). Doing
@@ -334,9 +405,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
 
             # (1) Mark per-request sink blocks (block_table[r][0]).
             for b in range(B):
-                row = block_table_cpu[b] if b < len(block_table_cpu) else []
-                if row and row[0] >= 0:
-                    sb = row[0]
+                if b >= bt_rows or bt_cols == 0:
+                    break
+                s0 = int(block_table_np[b, 0])
+                if s0 >= 0:
+                    sb = s0
                     if sb not in sinks:
                         sinks.add(sb)
                         if sb < is_sink_t.shape[0]:
@@ -355,20 +428,21 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             flush_block_ids: list[int] = []
             seen_sinks: set[int] = set()
             for b in range(B):
-                row = block_table_cpu[b] if b < len(block_table_cpu) else []
+                if b >= bt_rows or bt_cols == 0:
+                    break
                 sl = seq_lens_cpu[b]
-                if not row or row[0] < 0 or sl <= 0:
+                row = block_table_np[b]
+                sink_bid = int(row[0])
+                if sink_bid < 0 or sl <= 0:
                     continue
-                sink_bid = row[0]
                 seen_sinks.add(sink_bid)
                 prev_sl = self._prev_seq_len_by_sink.get(sink_bid, 0)
                 complete_in_pool = prev_sl // GROUP    # blocks 0..that-1 fully in pool
                 watermark = self._flush_watermark_by_sink.get(sink_bid, 1)  # skip sink (k=0)
-                for k in range(watermark, complete_in_pool):
-                    if k < len(row):
-                        bid = row[k]
-                        if bid >= 0 and bid not in sinks:
-                            flush_block_ids.append(bid)
+                for k in range(watermark, min(complete_in_pool, bt_cols)):
+                    bid = int(row[k])
+                    if bid >= 0 and bid not in sinks:
+                        flush_block_ids.append(bid)
                 if complete_in_pool > watermark:
                     self._flush_watermark_by_sink[sink_bid] = complete_in_pool
                 self._prev_seq_len_by_sink[sink_bid] = sl
@@ -386,7 +460,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 # — replaces 48×N_blocks individual launches. Numerically
                 # identical (per-tile-independent ops) → no accuracy change.
                 flush_pairs = []
-                for impl in KVarNAttentionImpl._all_impls:
+                for impl in group_impls:
                     kvc = getattr(impl, "_kv_cache_ref", None)
                     if kvc is None:
                         continue
@@ -426,14 +500,14 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     if not free_slots:
                         raise RuntimeError(
                             f"KVarN pool exhausted "
-                            f"({KVarNAttentionImpl._allocator_pool_size} slots)"
+                            f"({KVarNAttentionImpl._allocator_pool_size.get(gk)} slots)"
                         )
                     slot = free_slots.pop()
                     dict_map[bid] = slot
                     if bid < b2s_t.shape[0]:
                         b2s_t[bid] = slot
-                    KVarNAttentionImpl._max_known_block_id = max(
-                        KVarNAttentionImpl._max_known_block_id, bid
+                    KVarNAttentionImpl._max_known_block_id[gk] = max(
+                        KVarNAttentionImpl._max_known_block_id.get(gk, 0), bid
                     )
 
         # ── Persistent cu_seqlens buffers (in-place updated) ─────────────
@@ -468,7 +542,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             seq_lens_cpu=seq_lens_cpu,
-            block_table_cpu=block_table_cpu,
+            block_table_cpu=None,  # not consumed downstream; build() uses block_table_np
             slot_mapping_cpu=slot_mapping_cpu,
             fa_cu_seqlens_q=fa_cu_seqlens_q,
             fa_cu_seqlens_k=fa_cu_seqlens_k,
@@ -533,13 +607,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     # All allocator mutations happen in KVarNMetadataBuilder.build(), which
     # runs once per step OUTSIDE any captured CUDA-graph region. The captured
     # do_kv_cache_update kernel just reads block_to_slot_t.
-    _block_to_slot_dict: ClassVar[dict[int, int]] = {}
-    _global_sink_blocks: ClassVar[set[int]] = set()
-    _free_slots: ClassVar[list[int] | None] = None
-    _allocator_pool_size: ClassVar[int] = 0
-    _block_to_slot_t_per_device: ClassVar[dict[torch.device, torch.Tensor]] = {}
-    _is_sink_t_per_device: ClassVar[dict[torch.device, torch.Tensor]] = {}
-    _max_known_block_id: ClassVar[int] = 0
+    # Allocator state, scoped PER KV-CACHE-GROUP (key = group_key tuple), because
+    # block_ids are only unique WITHIN a group. CPU dicts keyed by group_key; GPU
+    # mirrors keyed by (device, group_key). See `self._group_key`.
+    _block_to_slot_dict: ClassVar[dict[tuple, dict[int, int]]] = {}
+    _global_sink_blocks: ClassVar[dict[tuple, set[int]]] = {}
+    _free_slots: ClassVar[dict[tuple, list[int]]] = {}
+    _allocator_pool_size: ClassVar[dict[tuple, int]] = {}
+    _block_to_slot_t_per_device: ClassVar[dict[tuple, torch.Tensor]] = {}
+    _is_sink_t_per_device: ClassVar[dict[tuple, torch.Tensor]] = {}
+    _max_known_block_id: ClassVar[dict[tuple, int]] = {}
     # Keys (device, D, group, k_bits, v_bits) whose flush kernels (Sinkhorn +
     # int4 store) have already been JIT-compiled via the pool-init warmup.
     _kernel_warmed: ClassVar[set] = set()
@@ -547,6 +624,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     # Registry of impls so the builder can enumerate per-layer pools when
     # it needs to update sink markers / trigger flushes.
     _all_impls: ClassVar[list["KVarNAttentionImpl"]] = []
+
+    @classmethod
+    def _impls_for_group(cls, group_key: tuple) -> list["KVarNAttentionImpl"]:
+        """Impls belonging to one KV-cache group (same group_key)."""
+        return [i for i in cls._all_impls if i._group_key == group_key]
 
     def __init__(
         self,
@@ -568,6 +650,24 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        # Sliding-window layers (e.g. Gemma-4: 50/60 layers, window 1024) only
+        # attend to the last `sliding_window` keys. Stored so the decode kernel
+        # can bound its block loop to the window — without this it reads the FULL
+        # history every step (16x too much work + wrong output past the window).
+        self.sliding_window = sliding_window or 0
+        # KV-cache-group key. KVarN's slot allocator + GPU mirrors are keyed by
+        # block_id, but vLLM gives each KV-cache group an INDEPENDENT block_id
+        # space. Heterogeneous models put KVarN layers in >1 group (e.g. Gemma-4:
+        # sliding head256/16kv + global head512/4kv), so a single global allocator
+        # aliases the two groups' block_ids -> wrong slots -> garbage. Scope all
+        # allocator state by this key so each group has its own slot space.
+        # (head_size, num_kv_heads, sliding_window) uniquely identifies the group
+        # and is computable identically by the per-group builder and each impl.
+        self._group_key = (head_size, self.num_kv_heads, self.sliding_window)
+        if os.environ.get("KVARN_DBG_LAYERS") == "1":
+            print(f"[KVARN_LAYER] head_size={head_size} num_heads={num_heads} "
+                  f"num_kv_heads={self.num_kv_heads} sliding_window={self.sliding_window}",
+                  flush=True)
 
         from vllm.model_executor.layers.quantization.kvarn.config import (
             KVarNConfig,
@@ -712,33 +812,43 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 dtype=torch.float16, device=device,
             )
             self._tail_V_pool = torch.zeros_like(self._tail_K_pool)
-            # Class-level allocator state — initialise once on the first
-            # impl seen on this device.
-            if cls._free_slots is None or cls._allocator_pool_size != pool_size:
-                cls._free_slots = list(range(pool_size - 1, -1, -1))
-                cls._allocator_pool_size = pool_size
-                cls._block_to_slot_dict.clear()
-                cls._global_sink_blocks.clear()
+        else:
+            pool_size = self._tail_K_pool.shape[0]
 
-        # GPU lookup tensors (per-device, shared across impls on that device).
-        num_blocks = max(num_blocks_hint, cls._max_known_block_id + 1, 1024)
-        existing = cls._block_to_slot_t_per_device.get(device)
+        # Per-GROUP allocator state — ensure it exists for THIS group_key.
+        # Decoupled from the per-impl pool allocation above: the impl's
+        # _group_key is set to the proxy in __init__ and later RE-TAGGED to the
+        # true (per-group) key by the builder, so the pool may already exist
+        # under a stale key when this group_key is first seen. Idempotent.
+        gk = self._group_key
+        if gk not in cls._free_slots:
+            cls._free_slots[gk] = list(range(pool_size - 1, -1, -1))
+            cls._allocator_pool_size[gk] = pool_size
+            cls._block_to_slot_dict[gk] = {}
+            cls._global_sink_blocks[gk] = set()
+
+        # GPU lookup tensors, keyed by (device, group_key): each KV-cache group
+        # has its own block_id space, so the two groups must NOT share a mirror.
+        gk = self._group_key
+        mkey = (device, gk)
+        num_blocks = max(num_blocks_hint, cls._max_known_block_id.get(gk, 0) + 1, 1024)
+        existing = cls._block_to_slot_t_per_device.get(mkey)
         if existing is None or existing.shape[0] < num_blocks:
             new_b2s = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
             new_is_sink = torch.zeros(num_blocks, dtype=torch.bool, device=device)
-            # Re-sync from class-level state (rare, only on resize / first init).
-            for bid, slot in cls._block_to_slot_dict.items():
+            # Re-sync from this group's CPU state (rare, only on resize / first init).
+            for bid, slot in cls._block_to_slot_dict.get(gk, {}).items():
                 if bid < num_blocks:
                     new_b2s[bid] = slot
-            for bid in cls._global_sink_blocks:
+            for bid in cls._global_sink_blocks.get(gk, set()):
                 if bid < num_blocks:
                     new_is_sink[bid] = True
-            cls._block_to_slot_t_per_device[device] = new_b2s
-            cls._is_sink_t_per_device[device] = new_is_sink
+            cls._block_to_slot_t_per_device[mkey] = new_b2s
+            cls._is_sink_t_per_device[mkey] = new_is_sink
         # Per-instance shorthand pointers so the decode driver / kernels read
         # without dict lookups in the hot path.
-        self._is_sink_t = cls._is_sink_t_per_device[device]
-        self._block_to_slot_t = cls._block_to_slot_t_per_device[device]
+        self._is_sink_t = cls._is_sink_t_per_device[mkey]
+        self._block_to_slot_t = cls._block_to_slot_t_per_device[mkey]
         self._block_lookup_size = self._block_to_slot_t.shape[0]
 
         # Cached fp16 Hadamard for the rotate-on-store matmul.
@@ -751,21 +861,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # boundary there). So they JIT-compile on the FIRST real flush DURING
         # serving — a multi-hundred-ms stall that surfaces as a latency spike
         # and a `jit_monitor` "JIT compilation during inference" warning, and
-        # disproportionately hurts low-concurrency aggregate throughput. Compile
-        # them here, once per shape/config, at pool-init time (outside any
-        # captured region) using the exact tile shapes / kernels the flush uses,
-        # so serving never pays the compile.
+        # disproportionately hurts low-concurrency aggregate throughput (the
+        # one-time cost lands inside a small measured window). Compile them here,
+        # once per shape/config, at pool-init time (outside any captured region)
+        # using the exact tile shapes the flush uses, so serving never pays it.
         warm_key = (device, cfg.head_dim, cfg.group, cfg.key_bits, cfg.value_bits)
         if warm_key not in cls._kernel_warmed:
-            D_, G_ = cfg.head_dim, cfg.group
-            k_d = torch.zeros(1, D_, G_, dtype=torch.float32, device=device)
-            v_d = torch.zeros(1, G_, D_, dtype=torch.float32, device=device)
-            _at = torch.cat([k_d, v_d], dim=0)
-            _ab, _asc, _asr = kvarn_sinkhorn_triton(_at, iterations=cfg.sinkhorn_iters)
-            kvarn_store_tile_k_batch_from_sinkhorn(
-                _ab[:1], _asc[:1], _asr[:1], bits=cfg.key_bits)
-            kvarn_store_tile_v_batch_from_sinkhorn(
-                _ab[1:], _asc[1:], _asr[1:], bits=cfg.value_bits)
+            k_dummy = torch.zeros(
+                1, cfg.head_dim, cfg.group, dtype=torch.float16, device=device)
+            v_dummy = torch.zeros(
+                1, cfg.group, cfg.head_dim, dtype=torch.float16, device=device)
+            _sinkhorn_pack_kv(k_dummy, v_dummy, cfg)
             cls._kernel_warmed.add(warm_key)
 
         # Store-side rotation scratch.
@@ -803,30 +909,43 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                           FA_SCRATCH_CAP),
                       self._max_model_len, 4096)
         cls = type(self)
-        if device not in cls._shared_q_fp32_buf:
-            cls._shared_q_fp32_buf[device] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
-            cls._shared_q_rot_fp32_buf[device] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
-            cls._shared_q_rot_fp16_buf[device] = torch.empty(q_rows, D, dtype=torch.float16, device=device)
-            cls._shared_out_rot_fp32_buf[device] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
-            cls._shared_output_fp32_buf[device] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
-            cls._shared_fused_out_buf[device] = torch.empty(q_rows, D, dtype=torch.float16, device=device)
-            from vllm.v1.attention.ops.triton_kvarn_decode import KVARN_NUM_KV_SPLITS
-            cls._shared_mid_o_buf[device] = torch.empty(q_rows, KVARN_NUM_KV_SPLITS, D, dtype=torch.float32, device=device)
-            cls._shared_mid_lse_buf[device] = torch.empty(q_rows, KVARN_NUM_KV_SPLITS, dtype=torch.float32, device=device)
-        if device not in cls._shared_fa_K_buf or cls._shared_fa_K_buf[device].shape[0] < fa_rows:
-            cls._shared_fa_K_buf[device] = torch.zeros(fa_rows, Hk, D, dtype=torch.float16, device=device)
-            cls._shared_fa_V_buf[device] = torch.zeros_like(cls._shared_fa_K_buf[device])
+        # Key the shared decode scratch by (device, D, Hk), NOT device alone:
+        # heterogeneous-head models (e.g. Gemma-4: 256-dim/16-kv sliding layers +
+        # 512-dim/4-kv global layers) have multiple (head_dim, kv_heads) combos,
+        # and a buffer sized for one combo's D/Hk is the wrong width for another
+        # (caused a reshape(N,512)-on-256-wide-buffer crash). One scratch set per
+        # combo (Gemma-4 = 2 sets; cost is small).
+        bkey = (device, D, Hk)
+        if bkey not in cls._shared_q_fp32_buf:
+            cls._shared_q_fp32_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
+            cls._shared_q_rot_fp32_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
+            cls._shared_q_rot_fp16_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float16, device=device)
+            cls._shared_out_rot_fp32_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
+            cls._shared_output_fp32_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
+            cls._shared_fused_out_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float16, device=device)
+            from vllm.v1.attention.ops.triton_kvarn_decode import adaptive_num_kv_splits
+            # Size the split-K partial buffers to EXACTLY the split count the decode
+            # driver will use for this deployment (same helper, same max_model_len),
+            # so short-context deployments keep the small 16-wide buffer (no memory
+            # change) and only long-context ones grow. Must match the driver or a
+            # larger adaptive count would overflow a smaller buffer.
+            _splits = adaptive_num_kv_splits((self._max_model_len + cfg.group - 1) // cfg.group)
+            cls._shared_mid_o_buf[bkey] = torch.empty(q_rows, _splits, D, dtype=torch.float32, device=device)
+            cls._shared_mid_lse_buf[bkey] = torch.empty(q_rows, _splits, dtype=torch.float32, device=device)
+        if bkey not in cls._shared_fa_K_buf or cls._shared_fa_K_buf[bkey].shape[0] < fa_rows:
+            cls._shared_fa_K_buf[bkey] = torch.zeros(fa_rows, Hk, D, dtype=torch.float16, device=device)
+            cls._shared_fa_V_buf[bkey] = torch.zeros_like(cls._shared_fa_K_buf[bkey])
         # Mirror to instance attrs for fast access by the decode driver.
-        self._q_fp32_buf = cls._shared_q_fp32_buf[device]
-        self._q_rot_fp32_buf = cls._shared_q_rot_fp32_buf[device]
-        self._q_rot_fp16_buf = cls._shared_q_rot_fp16_buf[device]
-        self._out_rot_fp32_buf = cls._shared_out_rot_fp32_buf[device]
-        self._output_fp32_buf = cls._shared_output_fp32_buf[device]
-        self._fused_out_buf = cls._shared_fused_out_buf[device]
-        self._mid_o_buf = cls._shared_mid_o_buf[device]
-        self._mid_lse_buf = cls._shared_mid_lse_buf[device]
-        self._fa_K_buf = cls._shared_fa_K_buf[device]
-        self._fa_V_buf = cls._shared_fa_V_buf[device]
+        self._q_fp32_buf = cls._shared_q_fp32_buf[bkey]
+        self._q_rot_fp32_buf = cls._shared_q_rot_fp32_buf[bkey]
+        self._q_rot_fp16_buf = cls._shared_q_rot_fp16_buf[bkey]
+        self._out_rot_fp32_buf = cls._shared_out_rot_fp32_buf[bkey]
+        self._output_fp32_buf = cls._shared_output_fp32_buf[bkey]
+        self._fused_out_buf = cls._shared_fused_out_buf[bkey]
+        self._mid_o_buf = cls._shared_mid_o_buf[bkey]
+        self._mid_lse_buf = cls._shared_mid_lse_buf[bkey]
+        self._fa_K_buf = cls._shared_fa_K_buf[bkey]
+        self._fa_V_buf = cls._shared_fa_V_buf[bkey]
     def _batch_slot_mapping_cpu(self) -> list[int] | None:
         """Return the slot_mapping CPU list cached on this step's metadata, or
         None if unavailable. Looks up via the forward context so we don't need
@@ -953,7 +1072,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         """
         cfg = self.kvarn_config
         cls = type(self)
-        slot = cls._block_to_slot_dict.get(block_id)
+        slot = cls._block_to_slot_dict.get(self._group_key, {}).get(block_id)
         if slot is None:
             # Block has no pool slot — nothing to flush.
             self._tails.pop(block_id, None)
@@ -966,18 +1085,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         K_tiles = K_rot.permute(1, 2, 0).contiguous()             # [Hk, D, group]
         V_tiles = V_rot.permute(1, 0, 2).contiguous()             # [Hk, group, D]
 
-        # One Triton launch for all 2*Hk tiles (same [R,C] shape).
-        all_tiles = torch.cat([K_tiles, V_tiles], dim=0)          # [2*Hk, 128, 128]
-        all_bal, all_sc, all_sr = kvarn_sinkhorn_triton(
-            all_tiles, iterations=cfg.sinkhorn_iters,
-        )
+        # Sinkhorn + pack (fused launch when square head_dim==group, else
+        # separate K/V launches — see _sinkhorn_pack_kv).
+        K_out, V_out = _sinkhorn_pack_kv(K_tiles, V_tiles, cfg)
         Hk = self.num_kv_heads
-        K_out = kvarn_store_tile_k_batch_from_sinkhorn(
-            all_bal[:Hk], all_sc[:Hk], all_sr[:Hk], bits=cfg.key_bits,
-        )
-        V_out = kvarn_store_tile_v_batch_from_sinkhorn(
-            all_bal[Hk:], all_sc[Hk:], all_sr[Hk:], bits=cfg.value_bits,
-        )
 
         for h in range(Hk):
             store_K = {k: v[h] for k, v in K_out.items()}
@@ -1018,12 +1129,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         kpb = cfg.k_packed_bytes
         vpb = cfg.v_packed_bytes
 
-        # Group by impl (layer); every impl flushes the SAME block set and the
-        # slot index is shared across layers' pools, so per impl we collect
-        # (kvc, bids, slots).
+        # Group by impl (layer); every impl flushes the SAME block set (the
+        # builder cross-products flush_block_ids with group_impls) and pool slot
+        # indices are shared across layers, so per impl we have (kvc, bids, slots).
         by_impl: dict = {}
         for impl, bid, kvc in flush_pairs:
-            slot = cls._block_to_slot_dict.get(bid)
+            slot = cls._block_to_slot_dict.get(impl._group_key, {}).get(bid)
             if slot is None:
                 impl._tails.pop(bid, None)
                 continue
@@ -1043,34 +1154,26 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             if kvc is None:
                 continue
             dev = impl._tail_K_pool.device
-            # WSL fix: one H2D for the whole block set, slice on device per chunk
-            # (was a torch.as_tensor H2D per chunk, expensive on WSL GPU-PV).
+            # WSL fix (PR #16): one H2D for the whole block set, slice on device
+            # per chunk (a torch.as_tensor H2D per chunk is a sync, ~100x on WSL).
             slots_dev = torch.as_tensor(slots, dtype=torch.long, device=dev)
             bids_dev = torch.as_tensor(bids, dtype=torch.long, device=dev)
             for c0 in range(0, len(bids), CHUNK_BLOCKS):
                 bchunk = bids[c0:c0 + CHUNK_BLOCKS]
                 nB = len(bchunk)
-                M = nB * Hk
                 slot_t = slots_dev[c0:c0 + CHUNK_BLOCKS]
                 bid_t = bids_dev[c0:c0 + CHUNK_BLOCKS]
                 # One gather per chunk (was nB tiny .float() ops).
                 K_rot = impl._tail_K_pool.index_select(0, slot_t).float()  # [nB,G,Hk,D]
                 V_rot = impl._tail_V_pool.index_select(0, slot_t).float()
-                # Tiles: K [M, D, G] (absorb=channel), V [M, G, D] (absorb=token).
-                K_tiles = K_rot.permute(0, 2, 3, 1).reshape(M, D, G)
-                V_tiles = V_rot.permute(0, 2, 1, 3).reshape(M, G, D)
-                # Same Sinkhorn + store as the legacy path (square 128x128 tile),
-                # so the packed bytes are identical.
-                all_tiles = torch.cat([K_tiles, V_tiles], dim=0)
-                all_bal, all_sc, all_sr = kvarn_sinkhorn_triton(
-                    all_tiles, iterations=cfg.sinkhorn_iters)
-                K_out = kvarn_store_tile_k_batch_from_sinkhorn(
-                    all_bal[:M], all_sc[:M], all_sr[:M], bits=cfg.key_bits)
-                V_out = kvarn_store_tile_v_batch_from_sinkhorn(
-                    all_bal[M:], all_sc[M:], all_sr[M:], bits=cfg.value_bits)
-                # Assemble the packed cache record [M, tile_bytes] by concatenating
-                # fields in config-offset order (fp16 scales byte-viewed to uint8),
-                # then pad to tile_bytes_aligned.
+                # Tiles: K [N, D, G] (absorb=channel), V [N, G, D] (absorb=token).
+                K_tiles = K_rot.permute(0, 2, 3, 1).reshape(nB * Hk, D, G)
+                V_tiles = V_rot.permute(0, 2, 1, 3).reshape(nB * Hk, G, D)
+                K_out, V_out = _sinkhorn_pack_kv(K_tiles, V_tiles, cfg)
+                # Assemble the packed cache record [nB*Hk, tile_bytes] by
+                # concatenating fields in config-offset order (fp16 scales
+                # byte-reinterpreted to uint8), then pad to tile_bytes_aligned.
+                M = nB * Hk
                 parts = [
                     K_out["q_packed_uint8"].reshape(M, kpb),
                     K_out["s_col_K"].contiguous().view(torch.uint8),
@@ -1110,7 +1213,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # by a sibling impl's flush already during this builder call).
         filt: list[tuple] = []
         for impl, bid, kvc in flush_pairs:
-            slot = cls._block_to_slot_dict.get(bid)
+            slot = cls._block_to_slot_dict.get(impl._group_key, {}).get(bid)
             if slot is None:
                 impl._tails.pop(bid, None)
                 continue
@@ -1158,20 +1261,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             K_tiles = K_stack.permute(0, 2, 3, 1).reshape(N * Hk, K_stack.shape[3], K_stack.shape[1])
             V_tiles = V_stack.permute(0, 2, 1, 3).reshape(N * Hk, V_stack.shape[1], V_stack.shape[3])
             del K_stack, V_stack
-            all_tiles = torch.cat([K_tiles, V_tiles], dim=0)                           # [2*N*Hk, R, C]
+            # Sinkhorn + pack (fused when square head_dim==group, else separate
+            # K/V launches for non-square head_dim=256 — see _sinkhorn_pack_kv).
+            K_out, V_out = _sinkhorn_pack_kv(K_tiles, V_tiles, cfg)
             del K_tiles, V_tiles
-            all_bal, all_sc, all_sr = kvarn_sinkhorn_triton(
-                all_tiles, iterations=cfg.sinkhorn_iters,
-            )
-            del all_tiles
-            nh = N * Hk
-            K_out = kvarn_store_tile_k_batch_from_sinkhorn(
-                all_bal[:nh], all_sc[:nh], all_sr[:nh], bits=cfg.key_bits,
-            )
-            V_out = kvarn_store_tile_v_batch_from_sinkhorn(
-                all_bal[nh:], all_sc[nh:], all_sr[nh:], bits=cfg.value_bits,
-            )
-            del all_bal, all_sc, all_sr
             # Distribute packed results to each (layer, block, head) cache slot.
             for i, (impl, bid, kvc, _) in enumerate(chunk):
                 for h in range(Hk):
@@ -1209,6 +1302,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         device = key.device
         Hk = self.num_kv_heads
         D = self.head_size
+
+        # bf16 boundary-cast (see forward): KVarN store/rotation is fp16.
+        if key.dtype != torch.float16:
+            key = key.to(torch.float16)
+            value = value.to(torch.float16)
 
         # Ensure pool + lookup tensors + rotation scratch exist (no-op during
         # capture; first call before capture sizes pool to kv_cache num_blocks).
@@ -1285,6 +1383,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # Flush is now triggered from KVarNMetadataBuilder.build() between
         # captured graph replays — nothing to do here at the top of forward.
 
+        # bf16 boundary-cast: KVarN's compute (rotation matmul, scratch buffers,
+        # Triton stores) is fp16 internally. Cast bf16 activations to fp16 at this
+        # entry point; the output write below casts back to output.dtype. fp16 is
+        # untouched (byte-identical), and the cast is lossless for KVarN (fp16
+        # mantissa > bf16, and the cache is 4-bit). Without this, bf16 q mixing
+        # with fp16 KV buffers trips "Expected out BFloat16, got Half".
+        if query.dtype != torch.float16:
+            query = query.to(torch.float16)
+            key = key.to(torch.float16)
+            value = value.to(torch.float16)
+
         q = query[:N].view(N, self.num_heads, self.head_size)
 
         if not attn_metadata.is_prefill:
@@ -1328,7 +1437,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         """First-chunk prefill: every request's full prompt is in the current
         batch, so attention runs on raw K/V via flash_attn_varlen. The K/V
         have already been written to the cache by `do_kv_cache_update`."""
-        if _HAS_FLASH_ATTN:
+        # FlashAttention caps head_dim at 256; the head_dim-512 global layers of
+        # Gemma-4 must use the SDPA path (handles arbitrary head_dim). Prefill is
+        # a one-time cost (decode dominates at long context), so SDPA here is fine.
+        if _HAS_FLASH_ATTN and self.head_size <= 256:
             return self._flash_varlen(
                 q, k, v,
                 cu_q=attn_metadata.query_start_loc,
@@ -1378,7 +1490,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # Stage α-2: a block lives in the fp16 pool iff it has a slot
         # (sinks + in-progress tails). Flushed blocks have their slot freed
         # and live in the int4 cache.
-        dict_map = type(self)._block_to_slot_dict
+        dict_map = type(self)._block_to_slot_dict.get(self._group_key, {})
 
         K_parts: list[torch.Tensor] = []
         V_parts: list[torch.Tensor] = []
@@ -1530,7 +1642,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             query_start_loc=prefill_qsl,
             num_actual_tokens=N - num_decode_tokens,
             max_query_len=attn_metadata.max_query_len,
-            max_seq_len=attn_metadata.max_seq_len,  # WSL fix: avoid per-step .item() D2H sync (global max is a safe upper bound for the prefill kernel)
+            max_seq_len=attn_metadata.max_seq_len,  # WSL fix (PR #16): avoid per-step .item() D2H sync (global max is a safe upper bound for the prefill kernel)
             is_prefill=True,
         )
         k_pref = k_all[num_decode_tokens:].view(-1, self.num_kv_heads, self.head_size)
