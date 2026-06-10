@@ -140,6 +140,9 @@ class KVarNAttentionBackend(AttentionBackend):
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "kvarn_k4v4_g128",
+        "kvarn_k4v2_g128",
+        "kvarn_k4v4_g64",
+        "kvarn_k4v2_g64",
     ]
 
     @staticmethod
@@ -148,7 +151,12 @@ class KVarNAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [128]
+        # One vLLM block == one KVarN tile (cfg.group). Supported tile sizes are
+        # the distinct `group` values across the registered presets (64, 128).
+        from vllm.model_executor.layers.quantization.kvarn.config import (
+            KVARN_PRESETS,
+        )
+        return sorted({p["group"] for p in KVARN_PRESETS.values()})
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
@@ -282,6 +290,22 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         except Exception:
             self._max_model_len = 4096
 
+        # KVarN tile / group size (= vLLM block size). Sourced from the configured
+        # kv-cache dtype so non-128 groups (e.g. g64) drive the flush + slot math
+        # in build() correctly. Every storage / kernel path already reads
+        # cfg.group; this is the one place the builder needs it without an impl
+        # handle. Falls back to 128 if it cannot be parsed.
+        self._group = 128
+        try:
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+            _cd = vllm_config.cache_config.cache_dtype
+            _hd = vllm_config.model_config.get_head_size()
+            self._group = KVarNConfig.from_cache_dtype(_cd, _hd).group
+        except Exception:
+            self._group = 128
+
         # Persistent cu_seqlens buffers (allocated lazily in build()).
         self._cu_seqlens_q_buf: torch.Tensor | None = None
         self._cu_seqlens_k_buf: torch.Tensor | None = None
@@ -324,7 +348,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # cu_seqlens_q (= arange(B+1)), both kept in PERSISTENT buffers and
         # updated in place so captured graphs see fresh values.
         B = len(seq_lens_cpu)
-        GROUP = 128                                    # KVarN cfg.group; fixed
+        GROUP = self._group                            # KVarN tile size (= block size); 64 or 128
         cu_seqlens_k_h = [0]
         for sl in seq_lens_cpu:
             cu_seqlens_k_h.append(cu_seqlens_k_h[-1] + sl)
