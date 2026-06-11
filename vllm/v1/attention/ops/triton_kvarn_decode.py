@@ -273,6 +273,8 @@ def _kvarn_build_packed_kv_kernel(
     MAX_BLOCKS_PER_REQ: tl.constexpr,
     D: tl.constexpr,
     GROUP: tl.constexpr,
+    K_BITS: tl.constexpr,
+    V_BITS: tl.constexpr,
     NUM_BLOCKS_LOOKUP: tl.constexpr,
     K_PACKED_OFFSET: tl.constexpr,
     K_S_COL_OFFSET: tl.constexpr,
@@ -329,12 +331,20 @@ def _kvarn_build_packed_kv_kernel(
         tl.store(K_out_ptr + out_addrs, K_chunk, mask=g_mask[:, None])
         tl.store(V_out_ptr + out_addrs, V_chunk, mask=g_mask[:, None])
     else:
-        # ── int4 quantised block: dequant in-place to rotated fp16 ─────────────
+        # ── quantised block: dequant in-place to rotated fp16. Bit-width-aware
+        # (issue #10): the K/V packing strides follow K_BITS / V_BITS exactly as
+        # in the fused decode kernels. The old hardcoded 4-bit V layout (stride
+        # D//2, shift (d%2)*4, mask 0xF) read past the 2-bit-V packed region of
+        # the default k4v2 preset into the V scales -> garbage V on this path.
+        PACK_K: tl.constexpr = 8 // K_BITS
+        PACK_V: tl.constexpr = 8 // V_BITS
+        MASK_K: tl.constexpr = (1 << K_BITS) - 1
+        MASK_V: tl.constexpr = (1 << V_BITS) - 1
         tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
-        g_byte_k = g_offs // 2
-        g_shift_k = (g_offs % 2) * 4
-        d_byte_v = d_offs // 2
-        d_shift_v = (d_offs % 2) * 4
+        g_byte_k = g_offs // PACK_K
+        g_shift_k = (g_offs % PACK_K) * K_BITS
+        d_byte_v = d_offs // PACK_V
+        d_shift_v = (d_offs % PACK_V) * V_BITS
 
         sk_lo = tl.load(KV_cache_ptr + tile_base + K_S_COL_OFFSET + d_offs * 2).to(tl.uint16)
         sk_hi = tl.load(KV_cache_ptr + tile_base + K_S_COL_OFFSET + d_offs * 2 + 1).to(tl.uint16)
@@ -347,9 +357,9 @@ def _kvarn_build_packed_kv_kernel(
         s_row_K = ((srk_lo | (srk_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
 
         k_addrs = (tile_base + K_PACKED_OFFSET
-                   + d_offs[:, None] * (GROUP // 2) + g_byte_k[None, :])
+                   + d_offs[:, None] * (GROUP // PACK_K) + g_byte_k[None, :])
         k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
-        q_K = ((k_bytes >> g_shift_k[None, :]) & 0xF).to(tl.float32)
+        q_K = ((k_bytes >> g_shift_k[None, :]) & MASK_K).to(tl.float32)
         K_rot = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]   # [D, GROUP]
         K_rot_out = tl.trans(K_rot)                                          # [GROUP, D]
 
@@ -364,9 +374,9 @@ def _kvarn_build_packed_kv_kernel(
         zp_V = ((zpv_lo | (zpv_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
 
         v_addrs = (tile_base + V_PACKED_OFFSET
-                   + g_offs[:, None] * (D // 2) + d_byte_v[None, :])
+                   + g_offs[:, None] * (D // PACK_V) + d_byte_v[None, :])
         v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
-        q_V = ((v_bytes >> d_shift_v[None, :]) & 0xF).to(tl.float32)
+        q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
         V_rot = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]   # [GROUP, D]
 
         tl.store(K_out_ptr + out_addrs, K_rot_out.to(tl.float16), mask=g_mask[:, None])
@@ -929,6 +939,7 @@ def kvarn_decode_attention(
                 K_packed.stride(0), K_packed.stride(1),
                 MAX_BLOCKS_PER_REQ=max_blocks_per_req,
                 D=D, GROUP=group,
+                K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
                 NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
                 K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
                 K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
