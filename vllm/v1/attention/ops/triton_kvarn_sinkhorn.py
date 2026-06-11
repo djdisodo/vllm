@@ -8,8 +8,8 @@ same 16 alternating col/row std-normalization passes, same best-so-far
 tracking via the imbalance metric, same clamps. One Triton program per
 ``[R, C]`` tile; the grid dim is the number of tiles in the batch.
 
-For ``R = C = 128`` the full tile is 64 KB fp32 — fits comfortably in a
-single Triton block's register/SMEM budget on Blackwell (228 KB / SM).
+For ``R = C = 128`` the full tile is 64 KB fp32 — fits in a single Triton
+block's register/SMEM budget on current GPUs.
 """
 
 from __future__ import annotations
@@ -189,7 +189,17 @@ def kvarn_sinkhorn_triton(
         CLIP_STD_MAX=_CLIP_STD_MAX,
         LOG_S_MIN=_LOG_S_MIN,
         LOG_S_MAX=_LOG_S_MAX,
-        num_warps=4,
+        # num_warps=8, not 4: the program keeps the whole [R, C] fp32 tile (plus
+        # a working copy) live, so at 4 warps the per-thread footprint is several
+        # KB of registers -> the compiler spills to CUDA local memory, and the
+        # driver permanently reserves local_bytes x max_threads x num_SMs of
+        # device memory for the context (~2 GiB on a 188-SM part for the
+        # [256, 128] tile; issue #10's missing-KV-capacity component). 8 warps
+        # halves the per-thread footprint: ~70% less reserved local memory AND
+        # ~4x faster flush (the spills were also the kernel's bottleneck).
+        # Balanced-tile output is unchanged within fp32 reduction noise (~5e-7
+        # rel); 16 warps saves a bit more memory but is 2x slower than 8.
+        num_warps=8,
         num_stages=2,
     )
     return balanced, s_col, s_row
