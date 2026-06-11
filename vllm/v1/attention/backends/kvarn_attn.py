@@ -297,13 +297,26 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         self._layer_names = list(layer_names)
         self._layer_names_set = set(self._layer_names)
         self._group_key = tuple(sorted(self._layer_names))
-        # Stage α-2: per-request fill tracking for flush detection, keyed by
-        # the sink block id so request identity survives batch reordering.
-        #   _prev_seq_len_by_sink[sink]  = seq_len at the previous step
-        #                                  (= tokens currently in the pool)
-        #   _flush_watermark_by_sink[sink] = next block index to flush
-        self._prev_seq_len_by_sink: dict[int, int] = {}
-        self._flush_watermark_by_sink: dict[int, int] = {}
+        # Stage α-2: per-block fill tracking — block_id -> tokens present in
+        # the pool for that block after the current step. Keyed by PHYSICAL
+        # block (never by request or by the sink block id): vLLM's prefix
+        # caching shares physical blocks across live requests and recycles ids
+        # across finished ones, so any request-identity proxy collides under
+        # sharing (the issue #10 repetition-collapse / stale-tile class). A
+        # partial block has exactly one writer, so the value has a single
+        # source. Drives flush-on-reclaim: a finished request's complete block
+        # must be flushed (a future prefix-cache hit may read it), a partial
+        # one is safe to discard (vLLM never prefix-caches partial blocks).
+        self._block_fill: dict[int, int] = {}
+        # Retired sinks: finished requests' sink blocks, kept RESIDENT in the
+        # fp16 pool (insertion order = retirement order) instead of flushed on
+        # reclaim. A prefix-cache hit re-adopts the block with its fp16 data
+        # byte-identical — preserving KVarN's fp16-sink accuracy on multi-turn
+        # traffic, where every follow-up turn reuses the previous turn's first
+        # block. Evicted (flushed to int4, so later cache hits still find a
+        # valid tile) lazily, oldest first, only when slot allocation runs
+        # dry — residency therefore never shrinks live capacity.
+        self._retired_sinks: dict[int, None] = {}
 
         # Max model length (for the fixed FA grid bound + max_blocks_per_req).
         try:
@@ -350,6 +363,18 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # avoid an extra GPU->CPU sync per step (issue #15 build-overhead).
         _slc = getattr(cam, "seq_lens_cpu", None)
         seq_lens_cpu = (_slc.tolist() if _slc is not None else cam.seq_lens.tolist())
+        # Per-request query length this step (already on CPU; no extra sync).
+        # Used by flush detection to compute committed tokens so speculative
+        # tokens that may still be rejected are never quantized permanently.
+        _qsl = getattr(cam, "query_start_loc_cpu", None)
+        if _qsl is not None:
+            _qsl_l = _qsl.tolist()
+            query_lens_cpu = [
+                _qsl_l[i + 1] - _qsl_l[i]
+                for i in range(len(_qsl_l) - 1)
+            ]
+        else:
+            query_lens_cpu = [1] * len(seq_lens_cpu)
         # block_table as a numpy 2-D array (C-backed, lazy element access) rather
         # than .tolist(): the full B×max_blocks nested-list build was ~7 ms/step
         # at B=256 and dominated build() once the flush was vectorized (issue #15).
@@ -380,26 +405,24 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # region). do_kv_cache_update then only READS block_to_slot_t.
         from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl  # local import
         # Pool slots are needed ONLY for blocks that physically live in the fp16
-        # tail pool: each request's sink (block_table[r][0], kept fp16 forever)
-        # and the in-progress tail block(s) currently being written — which are
-        # exactly the blocks named by slot_mapping this step (one tail per
-        # decoding request; the full set of touched blocks during a prefill
-        # chunk). Flushed history blocks (1..n_full-1) live in the int4 cache,
-        # carry pool_slot=-1, and are dequantized in-kernel.
+        # tail pool: each request's sink (block_table[r][0], kept fp16 for the
+        # request's lifetime) and the blocks receiving writes THIS step —
+        # tokens committed..seq_len-1 land in do_kv_cache_update after the
+        # builder. Flushed history blocks live in the int4 cache, carry
+        # pool_slot=-1, and are dequantized in-kernel.
         #
-        # Do NOT allocate slots for "every block up to seq_len": those history
-        # blocks would be (a) re-allocated every step but flushed only once,
-        # leaking the pool until it drains (RuntimeError: pool exhausted at long
-        # context), and (b) read from empty pool slots instead of int4 by the
-        # build kernel. slot_mapping + sink is necessary and sufficient.
-        # blocks_needed = the exact set of blocks that must hold a pool slot
-        # right now: per active request its sink (row[0]) + its in-progress tail
-        # (the block holding token seq_len-1, i.e. row[seq_len//GROUP]), plus
-        # every block named by slot_mapping this step (prefill chunks, and a
-        # safety superset of the tails). Anything in the allocator NOT in this
-        # set belongs to a completed request and is reclaimed below — sinks are
-        # otherwise never flushed, so without reclamation every finished
-        # request leaks its sink (and partial-tail) slot until the pool drains.
+        # Sharing-safe lifecycle (prefix caching + chunked prefill + spec
+        # decode): everything below derives from per-step facts —
+        #   committed = seq_len - query_len   (tokens written BEFORE this step)
+        #   dict_map membership = "block is unflushed" (ground truth: a flush
+        #     frees the slot, so a slot-holding block below the committed
+        #     boundary is exactly a full-but-unflushed block)
+        #   _block_fill[bid] = tokens the pool holds for bid after this step
+        # A cache-hit request's context blocks receive no writes, so they
+        # correctly need no slots (their tiles are already int4). Anything in
+        # the allocator NOT needed this step belongs to a finished request and
+        # is reclaimed below: complete blocks are FLUSHED (a future prefix-
+        # cache hit must find a valid int4 tile), partial ones discarded.
         blocks_needed: set[int] = set()
         for b in range(B):
             if b >= bt_rows:
@@ -408,15 +431,18 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             if bt_cols == 0 or sl <= 0:
                 continue
             row = block_table_np[b]
-            s0 = int(row[0])
-            if s0 >= 0:
-                blocks_needed.add(s0)              # sink (kept fp16 forever)
-            tail_idx = sl // GROUP                  # in-progress tail block
-            if tail_idx < bt_cols:
-                bt = int(row[tail_idx])
-                if bt >= 0:
-                    blocks_needed.add(bt)
-        for s in slot_mapping_cpu:                 # in-progress tail(s) / prefill
+            q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+            committed = max(sl - q_len, 0)
+            # Blocks written this step. Record how full each will be AFTER the
+            # step: if its owner finishes on the step that fills it, the
+            # reclaim below must flush it (not discard).
+            for k in range(committed // GROUP,
+                           min((sl - 1) // GROUP, bt_cols - 1) + 1):
+                bid = int(row[k])
+                if bid >= 0:
+                    blocks_needed.add(bid)
+                    self._block_fill[bid] = min(sl, (k + 1) * GROUP) - k * GROUP
+        for s in slot_mapping_cpu:                 # safety superset of the above
             if s >= 0:
                 blocks_needed.add(s // GROUP)
 
@@ -448,17 +474,44 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # boundary in lockstep (sink + pending-flush full block + new tail)
             # → "pool exhausted" at large batch.
 
-            # (1) Mark per-request sink blocks (block_table[r][0]).
+            # (1) Mark per-request sink blocks (block_table[r][0]). A block is
+            # an fp16 sink only while its data lives in the pool: a fresh
+            # prefill writes block 0 this step (it is in blocks_needed) and
+            # keeps it fp16 for the request's lifetime; an existing sink keeps
+            # its slot via blocks_needed. A prefix-cache-hit request whose
+            # block 0 was already reclaimed (flushed to int4) must NOT re-mark
+            # it: its data lives in the int4 tile (slot -1) and every kernel
+            # reads it there like any history block. Re-marking would allocate
+            # an EMPTY pool slot that is never written (cache hits skip those
+            # tokens) and attention would read garbage for the whole first
+            # block — the issue #10 repetition-loops on multi-turn chat.
+            row0_set: set[int] = set()
             for b in range(B):
                 if b >= bt_rows or bt_cols == 0:
                     break
                 s0 = int(block_table_np[b, 0])
-                if s0 >= 0:
-                    sb = s0
-                    if sb not in sinks:
-                        sinks.add(sb)
-                        if sb < is_sink_t.shape[0]:
-                            is_sink_t[sb] = True
+                if s0 < 0:
+                    continue
+                row0_set.add(s0)
+                if s0 in sinks:
+                    blocks_needed.add(s0)          # live/retired sink keeps its slot
+                elif s0 in blocks_needed:          # written this step → fresh sink
+                    sinks.add(s0)
+                    if s0 < is_sink_t.shape[0]:
+                        is_sink_t[s0] = True
+
+            # Un-retire any retired block named this step: a prefix-cache hit
+            # re-adopting a retired sink (its fp16 data is intact and byte-
+            # identical), or vLLM recycling the id for a fresh write. Either
+            # way the block is live again and must not be evicted under it.
+            # A recycled block that is no request's first block sheds its
+            # stale sink label so the normal walk-back flush applies to it.
+            for bid in [b for b in self._retired_sinks if b in blocks_needed]:
+                self._retired_sinks.pop(bid, None)
+                if bid not in row0_set and bid in sinks:
+                    sinks.discard(bid)
+                    if bid < is_sink_t.shape[0]:
+                        is_sink_t[bid] = False
 
             # (2) Flush detection (Stage α-2 Step B).
             # CRITICAL timing: token (k+1)*GROUP-1 (the one that completes
@@ -467,34 +520,71 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # tokens written through the PREVIOUS step. We therefore flush
             # against `prev_sl` (= pool token count now), never `sl`.
             #
-            # _prev_seq_len_by_sink[sink] holds the seq_len reported at the
-            # previous step = exactly the number of tokens now in the pool.
-            # _flush_watermark_by_sink[sink] = next block index to flush.
+            # Why not the full `sl` (or the previous step's `sl`): under
+            # speculative decoding (MTP / draft) a step appends `num_spec+1`
+            # tokens at once and seq_len jumps by a VARIABLE accepted amount,
+            # with later-rejected speculative tokens sitting in the pool until
+            # they are overwritten next step. Quantizing a block to int4 is
+            # PERMANENT, so flushing a block that still contains a speculative
+            # (rejectable) token freezes wrong KV → progressive corruption →
+            # repetition-collapse / garbage. Using the committed length means we
+            # only ever quantize blocks whose tokens are all accepted.
+            #
+            # Walk each row BACKWARD from the committed boundary while blocks
+            # still hold pool slots — those are exactly the full-but-unflushed
+            # blocks. The walk stops at the first slotless block (flushes
+            # happen in order, so everything earlier is already int4) and never
+            # touches k=0 (a live request's sink stays fp16; finished requests'
+            # sinks are handled by the reclaim below). Idempotent under prefix
+            # sharing: a co-owner finds the block already queued (or slotless)
+            # and stops — no per-request state to collide.
             flush_block_ids: list[int] = []
-            seen_sinks: set[int] = set()
+            flush_seen: set[int] = set()
             for b in range(B):
                 if b >= bt_rows or bt_cols == 0:
                     break
                 sl = seq_lens_cpu[b]
                 row = block_table_np[b]
-                sink_bid = int(row[0])
-                if sink_bid < 0 or sl <= 0:
+                if sl <= 0:
                     continue
-                seen_sinks.add(sink_bid)
-                prev_sl = self._prev_seq_len_by_sink.get(sink_bid, 0)
-                complete_in_pool = prev_sl // GROUP    # blocks 0..that-1 fully in pool
-                watermark = self._flush_watermark_by_sink.get(sink_bid, 1)  # skip sink (k=0)
-                for k in range(watermark, min(complete_in_pool, bt_cols)):
+                q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+                committed_len = max(sl - q_len, 0)    # tokens already in pool & accepted
+                k = min(committed_len // GROUP - 1, bt_cols - 1)
+                while 1 <= k:
                     bid = int(row[k])
-                    if bid >= 0 and bid not in sinks:
-                        flush_block_ids.append(bid)
-                if complete_in_pool > watermark:
-                    self._flush_watermark_by_sink[sink_bid] = complete_in_pool
-                self._prev_seq_len_by_sink[sink_bid] = sl
-            # Drop tracking for requests no longer present (completed).
-            for stale in [s for s in self._prev_seq_len_by_sink if s not in seen_sinks]:
-                del self._prev_seq_len_by_sink[stale]
-                self._flush_watermark_by_sink.pop(stale, None)
+                    if (bid < 0 or bid in flush_seen or bid in sinks
+                            or bid not in dict_map):
+                        break
+                    flush_seen.add(bid)
+                    flush_block_ids.append(bid)
+                    k -= 1
+
+            # (2b) Reclaim slot-holding blocks neither written this step nor
+            # queued above: they belong to finished (or preempted) requests.
+            # A COMPLETE sink is RETIRED — kept fp16-resident so a prefix-
+            # cache hit (every follow-up chat turn) re-adopts it byte-
+            # identically; the old discard destroyed its fp16-only data
+            # outright, garbling every multi-turn cache hit (issue #10 loops).
+            # Any other COMPLETE block is FLUSHED — vLLM's prefix cache may
+            # hand it to a future request, which must find a valid int4 tile
+            # (the old discard left stale tile bytes). A PARTIAL block is
+            # discarded: vLLM never prefix-caches partial blocks.
+            discard_ids: list[int] = []
+            for bid in [b for b in dict_map
+                        if b not in blocks_needed and b not in flush_seen]:
+                full = self._block_fill.get(bid, 0) >= GROUP
+                if full and bid in sinks:
+                    self._retired_sinks[bid] = None   # idempotent re-insert
+                    continue
+                if full:
+                    flush_seen.add(bid)
+                    flush_block_ids.append(bid)
+                else:
+                    discard_ids.append(bid)
+                if bid in sinks:                   # finished request's partial sink
+                    sinks.discard(bid)
+                    if bid < is_sink_t.shape[0]:
+                        is_sink_t[bid] = False
 
             # Trigger the flush on every layer's pool. Each impl quantises its
             # own pool[slot] into its own kv_cache (ref cached on first
@@ -516,32 +606,44 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 # reuse them (they now live in int4; pool_slot → -1).
                 for bid in flush_block_ids:
                     slot = dict_map.pop(bid, None)
+                    self._block_fill.pop(bid, None)
                     if slot is not None:
                         free_slots.append(slot)
                         if bid < b2s_t.shape[0]:
                             b2s_t[bid] = -1
 
-            # (2b) Reclaim stale slots from COMPLETED requests. Any block still
-            # holding a slot but not needed this step is a finished request's
-            # sink or partial tail (its data is dead — discard, do not flush).
-            # Without this, sinks (never flushed) leak one slot per finished
-            # request and the pool exhausts across requests / over serving.
-            for bid in [b for b in dict_map if b not in blocks_needed]:
+            # Free the discarded (partial, never-cacheable) blocks' slots.
+            for bid in discard_ids:
                 slot = dict_map.pop(bid)
+                self._block_fill.pop(bid, None)
                 free_slots.append(slot)
                 if bid < b2s_t.shape[0]:
                     b2s_t[bid] = -1
-                if bid in sinks:
-                    sinks.discard(bid)
-                    if bid < is_sink_t.shape[0]:
-                        is_sink_t[bid] = False
-                # Reset flush tracking so a recycled block_id starts fresh.
-                self._prev_seq_len_by_sink.pop(bid, None)
-                self._flush_watermark_by_sink.pop(bid, None)
 
             # (3) Allocate slots for any new block_ids (sinks + new tails).
             for bid in blocks_needed:
                 if bid not in dict_map:
+                    if not free_slots and self._retired_sinks:
+                        # Evict the oldest retired sink: flush it to int4 so a
+                        # later prefix-cache hit still finds a valid tile, then
+                        # hand its slot to the live allocation.
+                        old = next(iter(self._retired_sinks))
+                        self._retired_sinks.pop(old)
+                        evict_pairs = [
+                            (impl, old, impl._kv_cache_ref)
+                            for impl in group_impls
+                            if getattr(impl, "_kv_cache_ref", None) is not None
+                        ]
+                        KVarNAttentionImpl._batched_flush(evict_pairs)
+                        old_slot = dict_map.pop(old, None)
+                        self._block_fill.pop(old, None)
+                        sinks.discard(old)
+                        if old < is_sink_t.shape[0]:
+                            is_sink_t[old] = False
+                        if old < b2s_t.shape[0]:
+                            b2s_t[old] = -1
+                        if old_slot is not None:
+                            free_slots.append(old_slot)
                     if not free_slots:
                         raise RuntimeError(
                             f"KVarN pool exhausted "
