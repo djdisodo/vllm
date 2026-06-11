@@ -968,15 +968,23 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cls._shared_out_rot_fp32_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
             cls._shared_output_fp32_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
             cls._shared_fused_out_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float16, device=device)
-            from vllm.v1.attention.ops.triton_kvarn_decode import adaptive_num_kv_splits
-            # Size the split-K partial buffers to EXACTLY the split count the decode
-            # driver will use for this deployment (same helper, same max_model_len),
-            # so short-context deployments keep the small 16-wide buffer (no memory
-            # change) and only long-context ones grow. Must match the driver or a
-            # larger adaptive count would overflow a smaller buffer.
-            _splits = adaptive_num_kv_splits((self._max_model_len + cfg.group - 1) // cfg.group)
-            cls._shared_mid_o_buf[bkey] = torch.empty(q_rows, _splits, D, dtype=torch.float32, device=device)
-            cls._shared_mid_lse_buf[bkey] = torch.empty(q_rows, _splits, dtype=torch.float32, device=device)
+        from vllm.v1.attention.ops.triton_kvarn_decode import adaptive_num_kv_splits
+        # Split-K partial buffers, sized to EXACTLY what the split-K decode path
+        # can index: it runs ONLY on pure single-query decode steps, whose row
+        # count is N = B*Hq with B <= max_num_seqs — NOT q_rows (which is
+        # max_num_batched_tokens-driven and sized the buffer ~85x too big at
+        # typical configs: 256 MiB instead of ~3 MiB for max_num_seqs=2/Hq=24/
+        # 64 splits; issue #10 follow-up). Split count matches the driver's
+        # adaptive helper (same max_model_len) or a larger adaptive count would
+        # overflow a smaller buffer; the driver additionally falls back to the
+        # single-stage kernel if N ever exceeds the buffer rows (defensive —
+        # e.g. an oversized padded dummy batch).
+        _splits = adaptive_num_kv_splits((self._max_model_len + cfg.group - 1) // cfg.group)
+        mid_rows = max(self._max_num_seqs * Hq, 1)
+        _ex_mid = cls._shared_mid_o_buf.get(bkey)
+        if _ex_mid is None or _ex_mid.shape[0] < mid_rows or _ex_mid.shape[1] != _splits:
+            cls._shared_mid_o_buf[bkey] = torch.empty(mid_rows, _splits, D, dtype=torch.float32, device=device)
+            cls._shared_mid_lse_buf[bkey] = torch.empty(mid_rows, _splits, dtype=torch.float32, device=device)
         if bkey not in cls._shared_fa_K_buf or cls._shared_fa_K_buf[bkey].shape[0] < fa_rows:
             cls._shared_fa_K_buf[bkey] = torch.zeros(fa_rows, Hk, D, dtype=torch.float16, device=device)
             cls._shared_fa_V_buf[bkey] = torch.zeros_like(cls._shared_fa_K_buf[bkey])

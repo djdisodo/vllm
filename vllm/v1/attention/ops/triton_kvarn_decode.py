@@ -877,9 +877,14 @@ def kvarn_decode_attention(
     # occupancy the mid-buffer round-trip + stage-2 + empty-split waste roughly
     # HALVE throughput. So auto-enable only in the long-context, under-occupied
     # regime; KVARN_SPLIT_K env (0/1) is an explicit override.
+    # The split-K mid buffers are sized for the pure-decode regime
+    # (max_num_seqs * Hq rows); never split if this batch would overflow them
+    # (defensive — real decode batches always fit, but a padded dummy run can
+    # be wider). The single-stage kernel handles any batch size.
+    _mid_fits = impl._mid_o_buf is not None and N <= impl._mid_o_buf.shape[0]
     _sk_env = os.environ.get("KVARN_SPLIT_K")
     if _sk_env is not None:
-        split_k = use_fused and _sk_env == "1"
+        split_k = use_fused and _sk_env == "1" and _mid_fits
     else:
         sm_count = getattr(impl, "_sm_count", 0) or torch.cuda.get_device_properties(
             device).multi_processor_count
@@ -888,7 +893,8 @@ def kvarn_decode_attention(
         # Sliding-window layers read only ~window/GROUP blocks (single-stage is
         # plenty + the windowed loop is in the single-stage kernel), so never split.
         _sw = int(getattr(impl, "sliding_window", 0) or 0)
-        split_k = use_fused and (_sw <= 0) and (max_blocks_per_req >= 16) and (B * Hk <= sm_count)
+        split_k = (use_fused and (_sw <= 0) and (max_blocks_per_req >= 16)
+                   and (B * Hk <= sm_count) and _mid_fits)
     if use_fused and not split_k:
         fused_out = impl._fused_out_buf[:N]               # [N, D] fp16
         with torch.profiler.record_function("kvarn_fused_decode"):
