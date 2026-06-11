@@ -159,6 +159,27 @@ class KVarNAttentionBackend(AttentionBackend):
         return sorted({p["group"] for p in KVARN_PRESETS.values()})
 
     @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # The active preset pins the tile size (..._g64 / ..._g128), and
+        # get_kv_cache_shape asserts block_size == cfg.group. The generic
+        # fallback returns the MINIMUM supported size (64) whenever the
+        # framework default (16) is unsupported — which breaks any g128 preset
+        # run without an explicit --block-size (a g128 deployment then builds
+        # its cache with 64-token kernel blocks and dies on the assert, e.g.
+        # hybrid models without spec decode). Prefer the preset's group.
+        from vllm.config.vllm import get_current_vllm_config
+        from vllm.model_executor.layers.quantization.kvarn.config import (
+            KVARN_PRESETS,
+        )
+        try:
+            cache_dtype = get_current_vllm_config().cache_config.cache_dtype
+        except Exception:
+            cache_dtype = None
+        if isinstance(cache_dtype, str) and cache_dtype in KVARN_PRESETS:
+            return KVARN_PRESETS[cache_dtype]["group"]
+        return super().get_preferred_block_size(default_block_size)
+
+    @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         return attn_type == AttentionType.DECODER
 
