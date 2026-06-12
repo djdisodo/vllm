@@ -277,22 +277,44 @@ class KVarNMetadata(AttentionMetadata):
     fa_cu_seqlens_k: torch.Tensor | None = None       # [B+1] int32 (persistent prefix sum of seq_lens)
     fa_max_blocks_per_req: int = 0                    # ceil(max_model_len / group): grid dim
     fa_max_seqlen_k_fixed: int = 0                    # = max_model_len; fixed FA grid bound
+    # Verify (spec-as-decode) plan: one virtual kernel row per decode-portion
+    # query token. Persistent buffers (pointers baked into captured graphs),
+    # filled CPU-side in build(). None when the decode portion is single-token.
+    vq_req: torch.Tensor | None = None                # [num_decode_tokens] int32 block-table row
+    vq_seqlen: torch.Tensor | None = None             # [num_decode_tokens] int32 causal length
+    vq_qlen: int = 0                                  # uniform decode query len (>=2), else 0
 
 
 class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     """Builds ``KVarNMetadata`` from scheduler output."""
 
+    # UNIFORM_BATCH: spec-decode verify steps (uniform query length
+    # 1 + num_spec) are graph-capturable via the fused verify kernel — the
+    # whole MTP step replays as ONE full graph like vanilla FA, instead of
+    # ~num_layers eager attention calls between piecewise segments per step
+    # (the dominant MTP overhead once the materialize round-trip was gone;
+    # the gap to vanilla was 0.65-0.85x and worse under TP). All Python
+    # state mutation (slot allocation, sink marking, tile-boundary flush,
+    # the vq verify plan) happens in KVarNMetadataBuilder.build() between
+    # captured graph replays; the forward is pure tensor ops.
+    # KVARN_FUSED_VERIFY=0 reverts to single-token-only support.
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )  # Stage α-2: the decode forward + do_kv_cache_update are now pure
-       # tensor ops (Triton scatter + matmul + dequant/gather + flash_attn,
-       # all on pre-allocated scratch). All Python state mutation (slot
-       # allocation, sink marking, tile-boundary flush) happens in
-       # KVarNMetadataBuilder.build() between captured graph replays.
+        AttentionCGSupport.UNIFORM_BATCH
+        if os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
+        else AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
+        # spec-as-decode: verify steps (query_len <= 1 + num_spec) classify
+        # as decodes and carry a vq plan (see build()) for the fused verify
+        # kernel; the threshold is derived from speculative_config by the
+        # base helper.
+        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=(
+                os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"),
+        )
         # KV-cache-group key, must match KVarNAttentionImpl._group_key for this
         # group's layers so the builder mutates the right group's slot allocator.
         # (head_size, num_kv_heads, sliding_window) — see impl._group_key.
@@ -352,6 +374,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         self._cu_seqlens_k_buf: torch.Tensor | None = None
         self._cu_seqlens_q_host: torch.Tensor | None = None
         self._cu_seqlens_k_host: torch.Tensor | None = None
+        # Persistent verify-plan buffers (allocated lazily in build()).
+        self._vq_req_buf: torch.Tensor | None = None
+        self._vq_seqlen_buf: torch.Tensor | None = None
+        self._vq_req_host: torch.Tensor | None = None
+        self._vq_seqlen_host: torch.Tensor | None = None
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -684,6 +711,49 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         fa_cu_seqlens_q.copy_(self._cu_seqlens_q_host[:B + 1], non_blocking=True)
         fa_cu_seqlens_k.copy_(self._cu_seqlens_k_host[:B + 1], non_blocking=True)
 
+        # ── Verify (spec-as-decode) plan ─────────────────────────────────
+        # When the decode portion carries multi-token queries (an MTP verify
+        # step; query_len <= reorder threshold), build one virtual kernel row
+        # per decode token: its block-table row and its bottom-right causal
+        # length (committed + idx + 1). Persistent buffers, CPU-filled here,
+        # so the fused verify kernel is CUDA-graph-capturable (pointers stay
+        # stable across replays; only values change).
+        vq_req_t = vq_seqlen_t = None
+        vq_qlen = 0
+        if num_decodes > 0 and num_decode_tokens > num_decodes:
+            if (self._vq_req_buf is None
+                    or self._vq_req_buf.shape[0] < num_decode_tokens):
+                vq_cap = max(num_decode_tokens, 4096)
+                self._vq_req_buf = torch.empty(
+                    vq_cap, dtype=torch.int32, device=device)
+                self._vq_seqlen_buf = torch.empty(
+                    vq_cap, dtype=torch.int32, device=device)
+                self._vq_req_host = torch.empty(
+                    vq_cap, dtype=torch.int32, pin_memory=True)
+                self._vq_seqlen_host = torch.empty(
+                    vq_cap, dtype=torch.int32, pin_memory=True)
+            i = 0
+            uniform = query_lens_cpu[0] if num_decodes else 0
+            for b in range(num_decodes):
+                ql = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+                if ql != uniform:
+                    uniform = 0
+                committed = max(seq_lens_cpu[b] - ql, 0)
+                for j in range(ql):
+                    self._vq_req_host[i] = b
+                    self._vq_seqlen_host[i] = committed + j + 1
+                    i += 1
+            # Uniform query length -> the shared-dequant verify kernel (the
+            # request's tokens share each block's dequant); this is always the
+            # case under uniform-batch graph capture.
+            vq_qlen = uniform if uniform >= 2 else 0
+            vq_req_t = self._vq_req_buf[:num_decode_tokens]
+            vq_seqlen_t = self._vq_seqlen_buf[:num_decode_tokens]
+            vq_req_t.copy_(self._vq_req_host[:num_decode_tokens],
+                           non_blocking=True)
+            vq_seqlen_t.copy_(self._vq_seqlen_host[:num_decode_tokens],
+                              non_blocking=True)
+
         max_blocks_per_req = (self._max_model_len + GROUP - 1) // GROUP
 
         # A multi-query request with cached context (seq_len > query_len) is a
@@ -716,6 +786,9 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             fa_cu_seqlens_k=fa_cu_seqlens_k,
             fa_max_blocks_per_req=max_blocks_per_req,
             fa_max_seqlen_k_fixed=self._max_model_len,
+            vq_req=vq_req_t,
+            vq_seqlen=vq_seqlen_t,
+            vq_qlen=vq_qlen,
         )
 
 
@@ -1232,6 +1305,35 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             BLOCK_N=_bn, NUM_KV_SPLITS=splits, HQ=Hq,
             num_warps=_nw, num_stages=_ns, **common_vq,
         )
+        # 2c. Shared-dequant verify kernel (uniform-QLEN spec verify) — runs
+        # its @triton.autotune sweep here so capture never benchmarks. QLEN is
+        # the deployment's 1 + num_speculative_tokens.
+        try:
+            from vllm.config import get_current_vllm_config
+            _spec = get_current_vllm_config().speculative_config
+            _qlen = 1 + int(_spec.num_speculative_tokens) if _spec else 0
+        except Exception:
+            _qlen = 0
+        if _qlen >= 2:
+            from vllm.v1.attention.ops.triton_kvarn_decode import (
+                _kvarn_fused_verify_stage1,
+            )
+            nq = B * _qlen
+            sl_vq = sl.repeat_interleave(_qlen)
+            qv = torch.zeros(nq, Hq, D, dtype=torch.float16, device=device)
+            mid_o_v = torch.zeros(nq * Hq, splits, D, dtype=torch.float32,
+                                  device=device)
+            mid_lse_v = torch.zeros(nq * Hq, splits, dtype=torch.float32,
+                                    device=device)
+            common_v = dict(common)
+            _kvarn_fused_verify_stage1[(B, Hk, splits)](
+                qv, bt, sl_vq, b2s, cache, pool_k, pool_v,
+                mid_o_v, mid_lse_v, self.scale,
+                Hq * D, D, bt.stride(0), cache.stride(0), cache.stride(1),
+                pool_k.stride(0), pool_k.stride(1), pool_k.stride(2),
+                mid_o_v.stride(0), mid_o_v.stride(1), mid_lse_v.stride(0),
+                QLEN=_qlen, HQ=Hq, NUM_KV_SPLITS=splits, **common_v,
+            )
         # 3. Packed-KV build kernel (materialize fallback + the cached-multiquery
         # spec-verify path).
         kp = torch.zeros(B * n_blocks * G, Hk, D, dtype=torch.float16, device=device)
@@ -1715,6 +1817,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
         if not attn_metadata.is_prefill:
             attn_out = self._decode_path(q, kv_cache, attn_metadata)
+        elif (attn_metadata.vq_seqlen is not None
+              and attn_metadata.num_decode_tokens == N):
+            # Pure multi-token decode batch = a spec-decode verify step
+            # (uniform query length under graph capture). One fused-kernel
+            # pass over the vq plan — fully graph-capturable.
+            attn_out = self._verify_decode_path(q, kv_cache, attn_metadata)
         elif attn_metadata.num_decodes == 0:
             if attn_metadata.has_cached_multiquery:
                 # Speculative-decode verify (or chunked-prefill continuation):
@@ -1915,6 +2023,31 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             out[q_start:q_end] = o[0].transpose(0, 1).to(q.dtype)
         return out
 
+    def _verify_decode_path(
+        self, q: torch.Tensor, kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> torch.Tensor:
+        """Spec-as-decode verify using the builder's persistent vq plan.
+
+        Capture-safe: the vq buffers are persistent (filled CPU-side in
+        build() between replays), the block-table/seq-len bound is the
+        deployment constant, and the driver's intermediates are created
+        inside the captured region (graph-pool managed) — same pattern as
+        the single-token fused decode.
+        """
+        md = attn_metadata
+        group = self.kvarn_config.group
+        max_ctx_blocks = max((self._max_model_len + group - 1) // group, 1)
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            kvarn_verify_attention,
+        )
+        B = md.block_table.shape[0]
+        return kvarn_verify_attention(
+            q, kv_cache, md.block_table, self.scale, self.kvarn_config,
+            self, md.vq_req, md.vq_seqlen, max_ctx_blocks,
+            qlen=md.vq_qlen, seq_lens=md.seq_lens[:B],
+        )
+
     def _fused_verify_path(
         self, q: torch.Tensor, kv_cache: torch.Tensor,
         attn_metadata: KVarNMetadata,
@@ -2103,9 +2236,19 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             fa_max_blocks_per_req=mbpr,
             fa_max_seqlen_k_fixed=self._max_model_len,
         )
-        out[:num_decode_tokens] = self._decode_path(
-            q[:num_decode_tokens], kv_cache, decode_meta,
-        )
+        if attn_metadata.vq_seqlen is not None:
+            # Spec-as-decode: the decode portion carries multi-token verify
+            # queries — use the vq plan (mixed batches run eager, slices ok).
+            decode_meta.vq_req = attn_metadata.vq_req[:num_decode_tokens]
+            decode_meta.vq_seqlen = attn_metadata.vq_seqlen[:num_decode_tokens]
+            decode_meta.vq_qlen = attn_metadata.vq_qlen
+            out[:num_decode_tokens] = self._verify_decode_path(
+                q[:num_decode_tokens], kv_cache, decode_meta,
+            )
+        else:
+            out[:num_decode_tokens] = self._decode_path(
+                q[:num_decode_tokens], kv_cache, decode_meta,
+            )
 
         prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
         prefill_qsl = attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens

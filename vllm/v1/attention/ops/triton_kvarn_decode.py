@@ -534,6 +534,10 @@ def _kvarn_fused_decode_kernel(
     if VQ_INDIRECT:
         bt_row = tl.load(Req_row_ptr + b)
     seq_len = tl.load(Seq_lens_ptr + b)
+    # Padded rows (uniform-batch graph capture/replay pads the token count)
+    # carry seq_len <= 0: nothing to attend, the output row is never read.
+    if seq_len <= 0:
+        return
 
     d_offs = tl.arange(0, D)
     PACK_K: tl.constexpr = 8 // K_BITS
@@ -1004,17 +1008,19 @@ def kvarn_verify_attention(
     vq_req: torch.Tensor,               # [NQ] int32 — block-table row per token
     vq_seqlen: torch.Tensor,            # [NQ] int32 — causal len: cached+i+1
     max_ctx_blocks: int,                # ceil(max context / group) upper bound
+    qlen: int = 0,                      # uniform query length (>= 2), else 0
+    seq_lens: torch.Tensor | None = None,  # [B] int32 (uniform path)
 ) -> torch.Tensor:
-    """Fused multi-query verify (speculative decode): one program per
-    (query token, KV head), reading int4 tiles + the fp16 tail pool directly
-    with a per-token bottom-right causal length — no fp16 materialization of
-    the context. Replaces the build-packed-KV + flash_attn route whose
-    O(context)-per-step cost dominated MTP decode at long context (issue #10).
+    """Fused multi-query verify (speculative decode), reading int4 tiles +
+    the fp16 tail pool directly — no fp16 materialization of the context
+    (whose O(context)-per-step cost dominated MTP decode; issue #10).
 
-    Runs eagerly only (spec-verify steps are not graph-captured), so fresh
-    per-call buffers are fine. The query tokens of one request redundantly
-    re-dequant shared blocks (num_spec+1 times, <= KVARN_FUSED_VERIFY_MAXQ);
-    that costs far less than one full-context fp16 write+read round-trip.
+    Two modes:
+    - UNIFORM (qlen >= 2, the captured/common case): one program per
+      (request, kv head, split) — the request's QLEN tokens SHARE each
+      block's dequant, so KV bytes and dequant ALU match single-token decode.
+    - per-token fallback (qlen == 0, non-uniform eager batches): one program
+      per (query token, kv head) via the vq plan; QLEN-x redundant dequant.
 
     Output: ``[NQ, Hq, D]`` in ``query``'s dtype, un-rotated frame.
     """
@@ -1041,10 +1047,58 @@ def kvarn_verify_attention(
         K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
         V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
         V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
-        VQ_INDIRECT=True,
     )
 
     out_rot = torch.empty(NQ, Hq, D, dtype=torch.float16, device=device)
+
+    _m = qlen * (1 << ((Hq // Hk) - 1).bit_length() if Hq // Hk > 1 else 1)
+    if (qlen >= 2 and seq_lens is not None and NQ % qlen == 0
+            and (_m & (_m - 1)) == 0          # Q-tile rows must be a power of 2
+            # DEFAULT OFF: numerically validated in isolation (matches the
+            # per-token kernel within fp32 reduction noise on live inputs,
+            # incl. on the failing trajectory), but serving with it corrupts
+            # the MTP drafter's proposals (invalid [-1,...] spec tokens,
+            # embedding index asserts at temperature>0, degenerate greedy
+            # output) through a mechanism not yet isolated — suspicion is an
+            # interaction with async scheduling / drafter metadata rather
+            # than kernel math. Re-enable for debugging only.
+            and os.environ.get("KVARN_SHARED_VERIFY", "0") == "1"):
+        # SHARED-DEQUANT uniform path: split-K shaped (SPLITS=1 degenerates
+        # cleanly); stage2 combines into the flat [NQ*Hq, D] output.
+        B = NQ // qlen
+        SPLITS = (adaptive_num_kv_splits(max_ctx_blocks)
+                  if max_ctx_blocks >= 16 and B * Hk <= (
+                      getattr(impl, "_sm_count", 0)
+                      or torch.cuda.get_device_properties(
+                          device).multi_processor_count)
+                  else 1)
+        mid_o = torch.empty(Nrows, SPLITS, D, dtype=torch.float32,
+                            device=device)
+        mid_lse = torch.empty(Nrows, SPLITS, dtype=torch.float32,
+                              device=device)
+        _kvarn_fused_verify_stage1[(B, Hk, SPLITS)](
+            q_rot, block_table, vq_seqlen,
+            impl._block_to_slot_t,
+            kv_cache, impl._tail_K_pool, impl._tail_V_pool,
+            mid_o, mid_lse, scale,
+            Hq * D, D, block_table.stride(0),
+            kv_cache.stride(0), kv_cache.stride(1),
+            impl._tail_K_pool.stride(0), impl._tail_K_pool.stride(1),
+            impl._tail_K_pool.stride(2),
+            mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
+            QLEN=qlen, HQ=Hq, NUM_KV_SPLITS=SPLITS, **common,
+        )
+        out_flat = out_rot.view(Nrows, D)
+        _kvarn_fused_decode_stage2[(Nrows,)](
+            mid_o, mid_lse, out_flat,
+            mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
+            out_flat.stride(0),
+            D=D, NUM_KV_SPLITS=SPLITS, num_warps=2,
+        )
+        out_unrot = torch.mm(out_rot.reshape(Nrows, D), H16)
+        return out_unrot.view(NQ, Hq, D).to(out_dtype)
+
+    common["VQ_INDIRECT"] = True
 
     # Split-K mirrors the decode driver's heuristic: long context with too few
     # programs to fill the SMs. Verify batches are tiny (NQ <= maxq * B), so
@@ -1100,3 +1154,169 @@ def kvarn_verify_attention(
 
     out_unrot = torch.mm(out_rot.reshape(Nrows, D), H16)
     return out_unrot.view(NQ, Hq, D).to(out_dtype)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SHARED-DEQUANT verify kernel: one program per (REQUEST, kv-head, split) — all
+# QLEN verify tokens of a request share each block's dequant (the per-token
+# VQ_INDIRECT path above re-walks the context once per token, i.e. QLEN
+# redundant dequants). Q tile is [QLEN * Q_PER_KV_PAD, D] with a per-row
+# bottom-right causal limit: row (token j, lane h) attends kv positions
+# < seq_len - QLEN + j + 1. Uniform QLEN is a constexpr (uniform-batch graph
+# capture guarantees it); non-uniform eager batches fall back to the per-token
+# kernel. Scale vectors are loaded via fp16 pointer casts (the tile offsets are
+# 2-byte aligned) instead of the byte-pair loads of the older kernels.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 16}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=2),
+    ],
+    key=["D", "GROUP", "Q_PER_KV", "QLEN", "K_BITS", "V_BITS"],
+)
+@triton.jit
+def _kvarn_fused_verify_stage1(
+    Q_ptr,              # [NQ = B*QLEN, Hq, D] fp16 (rotated, token-major)
+    Block_table_ptr,    # [B, max_blocks] int32
+    Seq_lens_ptr,       # [NQ] int32 — the vq plan (per-token causal lengths);
+                        # the request's FULL length is its LAST token's entry.
+                        # Built CPU-side in the builder: under async spec
+                        # decode the device seq_lens tensor can disagree with
+                        # the builder's CPU view, and the CPU view is the one
+                        # the (validated) per-token path uses.
+    Block_to_slot_ptr, KV_cache_ptr,
+    Tail_K_pool_ptr, Tail_V_pool_ptr,
+    MidO_ptr,           # [NQ*Hq, NUM_KV_SPLITS, D] fp32
+    MidLse_ptr,         # [NQ*Hq, NUM_KV_SPLITS]    fp32
+    scale,
+    stride_q_t, stride_q_h,
+    stride_bt_b,
+    stride_kv_b, stride_kv_h,
+    stride_pool_b, stride_pool_t, stride_pool_h,
+    stride_mo_n, stride_mo_s, stride_ml_n,
+    MAX_BLOCKS_PER_REQ: tl.constexpr,  # unused; kept for launch-dict parity
+    D: tl.constexpr, GROUP: tl.constexpr, BLOCK_N: tl.constexpr,
+    QLEN: tl.constexpr, Q_PER_KV: tl.constexpr, Q_PER_KV_PAD: tl.constexpr,
+    HQ: tl.constexpr, NUM_KV_SPLITS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    K_BITS: tl.constexpr, V_BITS: tl.constexpr,
+    NUM_BLOCKS_LOOKUP: tl.constexpr,
+    K_PACKED_OFFSET: tl.constexpr, K_S_COL_OFFSET: tl.constexpr,
+    K_ZP_OFFSET: tl.constexpr, K_S_ROW_OFFSET: tl.constexpr,
+    V_PACKED_OFFSET: tl.constexpr, V_S_COL_OFFSET: tl.constexpr,
+    V_S_ROW_OFFSET: tl.constexpr, V_ZP_OFFSET: tl.constexpr,
+):
+    b = tl.program_id(0)
+    hk = tl.program_id(1)
+    split = tl.program_id(2)
+
+    seq_len = tl.load(Seq_lens_ptr + b * QLEN + (QLEN - 1))
+    # Padded rows (uniform-batch capture/replay) carry seq_len <= 0.
+    if seq_len <= 0:
+        return
+
+    M: tl.constexpr = QLEN * Q_PER_KV_PAD
+    r = tl.arange(0, M)
+    j = r // Q_PER_KV_PAD                                  # token idx in request
+    lane = r % Q_PER_KV_PAD                                # query-head lane
+    rmask = lane < Q_PER_KV
+    limit = seq_len - QLEN + j + 1                         # [M] causal kv limit
+    hq0 = hk * Q_PER_KV
+    d_offs = tl.arange(0, D)
+
+    PACK_K: tl.constexpr = 8 // K_BITS
+    PACK_V: tl.constexpr = 8 // V_BITS
+    MASK_K: tl.constexpr = (1 << K_BITS) - 1
+    MASK_V: tl.constexpr = (1 << V_BITS) - 1
+    d_byte_v = d_offs // PACK_V
+    d_shift_v = (d_offs % PACK_V) * V_BITS
+
+    tok_row = b * QLEN + j                                 # [M] token-major Q row
+    q = tl.load(Q_ptr + tok_row[:, None] * stride_q_t
+                + (hq0 + lane)[:, None] * stride_q_h + d_offs[None, :],
+                mask=rmask[:, None], other=0.0).to(tl.float32)   # [M, D]
+
+    m_i = tl.full([M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([M], dtype=tl.float32)
+    acc = tl.zeros([M, D], dtype=tl.float32)
+
+    n_blocks = (seq_len + GROUP - 1) // GROUP
+    blocks_per_split = (n_blocks + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
+    blk_lo = split * blocks_per_split
+    blk_hi = tl.minimum(blk_lo + blocks_per_split, n_blocks)
+
+    for k in range(blk_lo, blk_hi):
+        rem = seq_len - k * GROUP
+        n_tok = tl.minimum(tl.maximum(rem, 0), GROUP)
+        block_id = tl.load(Block_table_ptr + b * stride_bt_b + k)
+        in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
+        safe_bid = tl.where(in_range, block_id, 0)
+        pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
+        tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
+        safe_slot = tl.where(pool_slot >= 0, pool_slot, 0)
+        pool_base = safe_slot.to(tl.int64) * stride_pool_b + hk * stride_pool_h
+
+        # Per-channel scales — direct fp16 loads (2-byte-aligned offsets).
+        s_col_K = tl.load((KV_cache_ptr + tile_base + K_S_COL_OFFSET).to(
+            tl.pointer_type(tl.float16)) + d_offs).to(tl.float32)
+        zp_K = tl.load((KV_cache_ptr + tile_base + K_ZP_OFFSET).to(
+            tl.pointer_type(tl.float16)) + d_offs).to(tl.float32)
+        s_col_V = tl.load((KV_cache_ptr + tile_base + V_S_COL_OFFSET).to(
+            tl.pointer_type(tl.float16)) + d_offs).to(tl.float32)
+
+        for c0 in range(0, GROUP, BLOCK_N):
+            cols = c0 + tl.arange(0, BLOCK_N)
+            cmask = cols < n_tok
+            kvpos = k * GROUP + cols                              # [BN]
+
+            if pool_slot >= 0:
+                src = pool_base + cols[:, None] * stride_pool_t + d_offs[None, :]
+                Kc = tl.load(Tail_K_pool_ptr + src, mask=cmask[:, None],
+                             other=0.0).to(tl.float32)            # [BN, D]
+                Vc = tl.load(Tail_V_pool_ptr + src, mask=cmask[:, None],
+                             other=0.0).to(tl.float32)            # [BN, D]
+                K_dg = tl.trans(Kc)                               # [D, BN]
+            else:
+                cb_k = cols // PACK_K
+                cs_k = (cols % PACK_K) * K_BITS
+                s_row_K = tl.load((KV_cache_ptr + tile_base + K_S_ROW_OFFSET).to(
+                    tl.pointer_type(tl.float16)) + cols).to(tl.float32)
+                k_addrs = (tile_base + K_PACKED_OFFSET
+                           + d_offs[:, None] * (GROUP // PACK_K) + cb_k[None, :])
+                k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
+                q_K = ((k_bytes >> cs_k[None, :]) & MASK_K).to(tl.float32)
+                K_dg = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]
+                s_row_V = tl.load((KV_cache_ptr + tile_base + V_S_ROW_OFFSET).to(
+                    tl.pointer_type(tl.float16)) + cols).to(tl.float32)
+                zp_V = tl.load((KV_cache_ptr + tile_base + V_ZP_OFFSET).to(
+                    tl.pointer_type(tl.float16)) + cols).to(tl.float32)
+                v_addrs = (tile_base + V_PACKED_OFFSET
+                           + cols[:, None] * (D // PACK_V) + d_byte_v[None, :])
+                v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
+                q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+                Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]
+
+            scores = tl.dot(q, K_dg)                              # [M, BN]
+            smask = cmask[None, :] & (kvpos[None, :] < limit[:, None])
+            if SLIDING_WINDOW > 0:
+                smask = smask & (kvpos[None, :]
+                                 >= tl.maximum(limit[:, None] - SLIDING_WINDOW, 0))
+            scores = tl.where(smask, scores * scale, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+            p = tl.exp(scores - m_new[:, None])
+            alpha = tl.exp(m_i - m_new)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p, Vc)
+            m_i = m_new
+
+    nonempty = l_i > 0
+    O_s = acc / tl.where(nonempty, l_i, 1.0)[:, None]
+    lse_s = tl.where(nonempty,
+                     m_i + tl.log(tl.where(nonempty, l_i, 1.0)), -float("inf"))
+    rows = tok_row * HQ + hq0 + lane                              # [M] N-row index
+    tl.store(MidO_ptr + rows[:, None] * stride_mo_n + split * stride_mo_s
+             + d_offs[None, :], O_s, mask=rmask[:, None])
+    tl.store(MidLse_ptr + rows * stride_ml_n + split, lse_s, mask=rmask)
