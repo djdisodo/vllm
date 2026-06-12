@@ -1180,10 +1180,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
             V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+            VQ_INDIRECT=False,
         )
         # 1. Single-stage fused kernel — runs the @triton.autotune sweep.
+        # (sl doubles as the unused Req_row_ptr dummy; see VQ_INDIRECT.)
         _kvarn_fused_decode_kernel[(B, Hk)](
-            q, bt, sl, b2s, cache, pool_k, pool_v, out, self.scale,
+            q, sl, bt, sl, b2s, cache, pool_k, pool_v, out, self.scale,
             Hq * D, D, bt.stride(0), cache.stride(0), cache.stride(1),
             pool_k.stride(0), pool_k.stride(1), pool_k.stride(2),
             Hq * D, D, **common,
@@ -1197,7 +1199,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         mid_o = torch.zeros(B * Hq, splits, D, dtype=torch.float32, device=device)
         mid_lse = torch.zeros(B * Hq, splits, dtype=torch.float32, device=device)
         _kvarn_fused_decode_stage1[(B, Hk, splits)](
-            q, bt, sl, b2s, cache, pool_k, pool_v, mid_o, mid_lse, self.scale,
+            q, sl, bt, sl, b2s, cache, pool_k, pool_v, mid_o, mid_lse, self.scale,
             Hq * D, D, bt.stride(0), cache.stride(0), cache.stride(1),
             pool_k.stride(0), pool_k.stride(1), pool_k.stride(2),
             mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
@@ -1209,6 +1211,26 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             mid_o, mid_lse, out2d,
             mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
             out2d.stride(0), D=D, NUM_KV_SPLITS=splits, num_warps=2,
+        )
+        # 2b. VQ_INDIRECT (fused spec-verify) specializations — separate
+        # compiled variants; warm them so the FIRST MTP verify step doesn't
+        # pay the Triton JIT mid-serving.
+        vq_rows = torch.zeros(B, dtype=torch.int32, device=device)
+        common_vq = dict(common, VQ_INDIRECT=True)
+        _kvarn_fused_decode_kernel[(B, Hk)](
+            q, vq_rows, bt, sl, b2s, cache, pool_k, pool_v, out, self.scale,
+            Hq * D, D, bt.stride(0), cache.stride(0), cache.stride(1),
+            pool_k.stride(0), pool_k.stride(1), pool_k.stride(2),
+            Hq * D, D, **common_vq,
+        )
+        _kvarn_fused_decode_stage1[(B, Hk, splits)](
+            q, vq_rows, bt, sl, b2s, cache, pool_k, pool_v, mid_o, mid_lse,
+            self.scale,
+            Hq * D, D, bt.stride(0), cache.stride(0), cache.stride(1),
+            pool_k.stride(0), pool_k.stride(1), pool_k.stride(2),
+            mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
+            BLOCK_N=_bn, NUM_KV_SPLITS=splits, HQ=Hq,
+            num_warps=_nw, num_stages=_ns, **common_vq,
         )
         # 3. Packed-KV build kernel (materialize fallback + the cached-multiquery
         # spec-verify path).
@@ -1893,6 +1915,51 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             out[q_start:q_end] = o[0].transpose(0, 1).to(q.dtype)
         return out
 
+    def _fused_verify_path(
+        self, q: torch.Tensor, kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> torch.Tensor:
+        """Speculative-decode verify via the fused dual-source kernel.
+
+        Each query token becomes a virtual kernel row with its own
+        bottom-right causal length (cached_len + idx + 1) and an indirection
+        to its request's block-table row — so the verify step reads int4
+        tiles + the fp16 pool directly instead of materializing the whole
+        context to fp16 scratch every step (O(context)/step; the issue #10
+        long-context MTP collapse: measured 88 -> 45 tok/s from 2K -> 32K
+        with the materialize route vs near-flat without MTP).
+
+        Eager-only (verify steps are not graph-captured): fresh small
+        tensors per call are fine.
+        """
+        md = attn_metadata
+        B = md.block_table.shape[0]
+        n_tok = q.shape[0]
+        device = q.device
+        group = self.kvarn_config.group
+
+        qsl = md.query_start_loc[:B + 1].to(torch.long)
+        qlens = qsl[1:] - qsl[:-1]                              # [B]
+        vq_req_long = torch.repeat_interleave(
+            torch.arange(B, device=device), qlens)              # [n_tok]
+        pos_in_req = torch.arange(n_tok, device=device) - qsl[:-1][vq_req_long]
+        committed = md.seq_lens[:B].to(torch.long) - qlens
+        vq_seqlen = (committed[vq_req_long] + pos_in_req + 1).to(torch.int32)
+        vq_req = vq_req_long.to(torch.int32)
+
+        max_ctx_blocks = min(
+            (int(md.max_seq_len) + group - 1) // group,
+            md.block_table.shape[1])
+        max_ctx_blocks = max(max_ctx_blocks, 1)
+
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            kvarn_verify_attention,
+        )
+        return kvarn_verify_attention(
+            q, kv_cache, md.block_table, self.scale, self.kvarn_config,
+            self, vq_req, vq_seqlen, max_ctx_blocks,
+        )
+
     def _cached_multiquery_path(
         self, q: torch.Tensor, kv_cache: torch.Tensor,
         attn_metadata: KVarNMetadata,
@@ -1917,6 +1984,26 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         """
         md = attn_metadata
         B = md.block_table.shape[0]
+        # Small-qlen multi-query (the spec-decode verify step: every decode
+        # step under MTP) goes to the FUSED verify kernel: per-token virtual
+        # rows over the dual-source decode kernel, no fp16 materialization.
+        # Routed by CONTEXT depth (measured, Qwen3.6-27B AWQ single stream):
+        # materialize wins short context (88 vs 81 tok/s @2K — its one
+        # write+read is cheap there and the fused per-call overhead shows);
+        # fused wins long context (51 vs 45 @32K, growing with depth — the
+        # materialize round-trip is the O(context)/step issue #10 MTP
+        # slowdown). Crossover ~12K; default threshold 64 blocks (8K).
+        # The materialize+FA route also keeps LARGE qlen (chunked-prefill
+        # continuations), where one materialization amortizes over thousands
+        # of query tokens. KVARN_FUSED_VERIFY=0 forces materialize always.
+        _group = self.kvarn_config.group
+        if (os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
+                and md.max_query_len
+                <= int(os.environ.get("KVARN_FUSED_VERIFY_MAXQ", "8"))
+                and (int(md.max_seq_len) + _group - 1) // _group
+                >= int(os.environ.get("KVARN_FUSED_VERIFY_MIN_BLOCKS", "64"))
+                and B > 0):
+            return self._fused_verify_path(q, kv_cache, md)
         if (not _HAS_FLASH_ATTN or self.head_size > 256
                 or self._fa_K_buf is None):
             return self._decode_path_slow(q, kv_cache, md)

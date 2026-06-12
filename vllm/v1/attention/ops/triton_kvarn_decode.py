@@ -473,6 +473,7 @@ def _kvarn_pool_gather_packed_kernel(  # noqa: SUPERSEDED by _kvarn_build_packed
 @triton.jit
 def _kvarn_fused_decode_kernel(
     Q_ptr,              # [B, Hq, D]                               fp16 (rotated)
+    Req_row_ptr,        # [B] int32 — block-table row per program row (VQ_INDIRECT)
     Block_table_ptr,    # [B, max_blocks]                          int32
     Seq_lens_ptr,       # [B]                                      int32
     Block_to_slot_ptr,  # [num_blocks_lookup]                      int32 (-1 = int4)
@@ -506,6 +507,7 @@ def _kvarn_fused_decode_kernel(
     V_S_COL_OFFSET: tl.constexpr,
     V_S_ROW_OFFSET: tl.constexpr,
     V_ZP_OFFSET: tl.constexpr,
+    VQ_INDIRECT: tl.constexpr,
 ):
     # GQA head-grouping: ONE program per (request, KV head) serves all Q_PER_KV
     # query heads that share this KV head, so each int4 K/V tile is dequantized
@@ -514,12 +516,23 @@ def _kvarn_fused_decode_kernel(
     # Q_PER_KV is padded to a power of 2 (Q_PER_KV_PAD) because tl.arange / tl.dot
     # require pow2 dims; padded query heads are masked off (e.g. Qwen3.5 GQA 24/4
     # = ratio 6 -> pad to 8).
+    #
+    # VQ_INDIRECT (multi-query verify): program row b is a QUERY TOKEN, not a
+    # request — Req_row_ptr[b] gives its block-table row and Seq_lens_ptr[b] its
+    # bottom-right causal length (cached_len + token_idx + 1). Q/Out stay
+    # token-major, so everything else is unchanged: the speculative-decode
+    # verify step runs the same dual-source (int4 + pool) online-softmax read
+    # instead of materializing the whole context to fp16 scratch (O(context)
+    # per step — the issue #10 long-context MTP slowdown).
     b = tl.program_id(0)
     hk = tl.program_id(1)
     qh = tl.arange(0, Q_PER_KV_PAD)                        # padded query-head lane
     qmask = qh < Q_PER_KV                                  # real heads in this group
     hq0 = hk * Q_PER_KV
 
+    bt_row = b
+    if VQ_INDIRECT:
+        bt_row = tl.load(Req_row_ptr + b)
     seq_len = tl.load(Seq_lens_ptr + b)
 
     d_offs = tl.arange(0, D)
@@ -551,7 +564,7 @@ def _kvarn_fused_decode_kernel(
         rem = seq_len - k * GROUP
         n_tok = tl.minimum(tl.maximum(rem, 0), GROUP)
 
-        block_id = tl.load(Block_table_ptr + b * stride_bt_b + k)
+        block_id = tl.load(Block_table_ptr + bt_row * stride_bt_b + k)
         in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
         safe_bid = tl.where(in_range, block_id, 0)
         pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
@@ -635,8 +648,8 @@ def _kvarn_fused_decode_kernel(
 
 @triton.jit
 def _kvarn_fused_decode_stage1(
-    Q_ptr, Block_table_ptr, Seq_lens_ptr, Block_to_slot_ptr, KV_cache_ptr,
-    Tail_K_pool_ptr, Tail_V_pool_ptr,
+    Q_ptr, Req_row_ptr, Block_table_ptr, Seq_lens_ptr, Block_to_slot_ptr,
+    KV_cache_ptr, Tail_K_pool_ptr, Tail_V_pool_ptr,
     MidO_ptr,           # [N, NUM_KV_SPLITS, D]            fp32 (O_s = acc/l per split)
     MidLse_ptr,         # [N, NUM_KV_SPLITS]               fp32 (lse_s = m + log l)
     scale,
@@ -655,6 +668,7 @@ def _kvarn_fused_decode_stage1(
     K_ZP_OFFSET: tl.constexpr, K_S_ROW_OFFSET: tl.constexpr,
     V_PACKED_OFFSET: tl.constexpr, V_S_COL_OFFSET: tl.constexpr,
     V_S_ROW_OFFSET: tl.constexpr, V_ZP_OFFSET: tl.constexpr,
+    VQ_INDIRECT: tl.constexpr,
 ):
     b = tl.program_id(0)
     hk = tl.program_id(1)
@@ -663,6 +677,11 @@ def _kvarn_fused_decode_stage1(
     qmask = qh < Q_PER_KV
     hq0 = hk * Q_PER_KV
 
+    # VQ_INDIRECT: row b is a query TOKEN (verify step); see the single-stage
+    # kernel's note. Block table via Req_row_ptr, causal length via Seq_lens.
+    bt_row = b
+    if VQ_INDIRECT:
+        bt_row = tl.load(Req_row_ptr + b)
     seq_len = tl.load(Seq_lens_ptr + b)
     n_blocks = (seq_len + GROUP - 1) // GROUP
     blocks_per_split = (n_blocks + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
@@ -686,7 +705,7 @@ def _kvarn_fused_decode_stage1(
     for k in range(blk_lo, blk_hi):
         rem = seq_len - k * GROUP
         n_tok = tl.minimum(tl.maximum(rem, 0), GROUP)
-        block_id = tl.load(Block_table_ptr + b * stride_bt_b + k)
+        block_id = tl.load(Block_table_ptr + bt_row * stride_bt_b + k)
         in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
         safe_bid = tl.where(in_range, block_id, 0)
         pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
@@ -862,6 +881,7 @@ def kvarn_decode_attention(
         K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
         V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
         V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+        VQ_INDIRECT=False,
     )
     # SPLIT-K (KVARN_SPLIT_K=1): two-stage flash-decoding — only a win in the
     # LOW-batch / long-context regime (few programs ⇒ the KV-split dim adds the
@@ -899,7 +919,8 @@ def kvarn_decode_attention(
         fused_out = impl._fused_out_buf[:N]               # [N, D] fp16
         with torch.profiler.record_function("kvarn_fused_decode"):
             _kvarn_fused_decode_kernel[(B, Hk)](
-                q_rot_fp16, md.block_table, md.seq_lens, impl._block_to_slot_t,
+                q_rot_fp16, md.seq_lens, md.block_table, md.seq_lens,
+                impl._block_to_slot_t,
                 kv_cache, impl._tail_K_pool, impl._tail_V_pool, fused_out, scale,
                 Hq * D, D, md.block_table.stride(0),
                 kv_cache.stride(0), kv_cache.stride(1),
@@ -914,7 +935,8 @@ def kvarn_decode_attention(
         fused_out = impl._fused_out_buf[:N]
         with torch.profiler.record_function("kvarn_fused_decode_s1"):
             _kvarn_fused_decode_stage1[(B, Hk, SPLITS)](
-                q_rot_fp16, md.block_table, md.seq_lens, impl._block_to_slot_t,
+                q_rot_fp16, md.seq_lens, md.block_table, md.seq_lens,
+                impl._block_to_slot_t,
                 kv_cache, impl._tail_K_pool, impl._tail_V_pool, mid_o, mid_lse, scale,
                 Hq * D, D, md.block_table.stride(0),
                 kv_cache.stride(0), kv_cache.stride(1),
@@ -970,3 +992,111 @@ def kvarn_decode_attention(
     with torch.profiler.record_function("kvarn_output_unrotation"):
         out_unrot = torch.mm(output_rot.reshape(N, D), H16)   # fresh fp16
         return out_unrot.view(B, Hq, D).to(out_dtype)
+
+
+def kvarn_verify_attention(
+    query: torch.Tensor,                # [NQ, Hq, D]  fp16/bf16 (token-major)
+    kv_cache: torch.Tensor,             # [num_blocks, Hk, TILE_BYTES] uint8
+    block_table: torch.Tensor,          # [B, max_blocks] int32
+    scale: float,
+    cfg,
+    impl,                               # KVarNAttentionImpl
+    vq_req: torch.Tensor,               # [NQ] int32 — block-table row per token
+    vq_seqlen: torch.Tensor,            # [NQ] int32 — causal len: cached+i+1
+    max_ctx_blocks: int,                # ceil(max context / group) upper bound
+) -> torch.Tensor:
+    """Fused multi-query verify (speculative decode): one program per
+    (query token, KV head), reading int4 tiles + the fp16 tail pool directly
+    with a per-token bottom-right causal length — no fp16 materialization of
+    the context. Replaces the build-packed-KV + flash_attn route whose
+    O(context)-per-step cost dominated MTP decode at long context (issue #10).
+
+    Runs eagerly only (spec-verify steps are not graph-captured), so fresh
+    per-call buffers are fine. The query tokens of one request redundantly
+    re-dequant shared blocks (num_spec+1 times, <= KVARN_FUSED_VERIFY_MAXQ);
+    that costs far less than one full-context fp16 write+read round-trip.
+
+    Output: ``[NQ, Hq, D]`` in ``query``'s dtype, un-rotated frame.
+    """
+    NQ, Hq, D = query.shape
+    Hk = kv_cache.shape[1]
+    device = query.device
+    out_dtype = query.dtype
+    group = cfg.group
+    Nrows = NQ * Hq
+
+    H16 = (impl._H_fp16 if impl._H_fp16 is not None
+           else impl._hadamard(device).to(torch.float16))
+    q_rot = torch.mm(query.reshape(Nrows, D).to(torch.float16), H16)
+
+    _qpk = Hq // Hk
+    _qpk_pad = 1 << (_qpk - 1).bit_length() if _qpk > 1 else 1
+    common = dict(
+        MAX_BLOCKS_PER_REQ=max_ctx_blocks, D=D, GROUP=group,
+        Q_PER_KV=_qpk, Q_PER_KV_PAD=_qpk_pad,
+        SLIDING_WINDOW=int(getattr(impl, "sliding_window", 0) or 0),
+        K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
+        NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
+        K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
+        K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
+        V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
+        V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+        VQ_INDIRECT=True,
+    )
+
+    out_rot = torch.empty(NQ, Hq, D, dtype=torch.float16, device=device)
+
+    # Split-K mirrors the decode driver's heuristic: long context with too few
+    # programs to fill the SMs. Verify batches are tiny (NQ <= maxq * B), so
+    # long-context verify nearly always wants the split.
+    sm_count = getattr(impl, "_sm_count", 0) or torch.cuda.get_device_properties(
+        device).multi_processor_count
+    _sw = int(getattr(impl, "sliding_window", 0) or 0)
+    _sk_env = os.environ.get("KVARN_SPLIT_K")
+    if _sk_env is not None:
+        split_k = _sk_env == "1"
+    else:
+        split_k = (_sw <= 0) and (max_ctx_blocks >= 16) and (NQ * Hk <= sm_count)
+
+    if not split_k:
+        _kvarn_fused_decode_kernel[(NQ, Hk)](
+            q_rot, vq_req, block_table, vq_seqlen,
+            impl._block_to_slot_t,
+            kv_cache, impl._tail_K_pool, impl._tail_V_pool,
+            out_rot, scale,
+            Hq * D, D, block_table.stride(0),
+            kv_cache.stride(0), kv_cache.stride(1),
+            impl._tail_K_pool.stride(0), impl._tail_K_pool.stride(1),
+            impl._tail_K_pool.stride(2),
+            Hq * D, D, **common,
+        )
+    else:
+        SPLITS = adaptive_num_kv_splits(max_ctx_blocks)
+        mid_o = torch.empty(Nrows, SPLITS, D, dtype=torch.float32, device=device)
+        mid_lse = torch.empty(Nrows, SPLITS, dtype=torch.float32, device=device)
+        _bn = int(os.environ.get("KVARN_BLOCK_N", "16"))
+        _nw = int(os.environ.get("KVARN_NUM_WARPS", "4"))
+        _ns = int(os.environ.get("KVARN_NUM_STAGES", "2"))
+        _kvarn_fused_decode_stage1[(NQ, Hk, SPLITS)](
+            q_rot, vq_req, block_table, vq_seqlen,
+            impl._block_to_slot_t,
+            kv_cache, impl._tail_K_pool, impl._tail_V_pool,
+            mid_o, mid_lse, scale,
+            Hq * D, D, block_table.stride(0),
+            kv_cache.stride(0), kv_cache.stride(1),
+            impl._tail_K_pool.stride(0), impl._tail_K_pool.stride(1),
+            impl._tail_K_pool.stride(2),
+            mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
+            BLOCK_N=_bn, NUM_KV_SPLITS=SPLITS, HQ=Hq,
+            num_warps=_nw, num_stages=_ns, **common,
+        )
+        out_flat = out_rot.view(Nrows, D)
+        _kvarn_fused_decode_stage2[(Nrows,)](
+            mid_o, mid_lse, out_flat,
+            mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
+            out_flat.stride(0),
+            D=D, NUM_KV_SPLITS=SPLITS, num_warps=2,
+        )
+
+    out_unrot = torch.mm(out_rot.reshape(Nrows, D), H16)
+    return out_unrot.view(NQ, Hq, D).to(out_dtype)
