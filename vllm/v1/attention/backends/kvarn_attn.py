@@ -1266,18 +1266,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # 2. Split-K stage1 + stage2, with the exact split count and launch
         # knobs the decode driver will use for this deployment.
         splits = adaptive_num_kv_splits((self._max_model_len + G - 1) // G)
-        _bn = int(os.environ.get("KVARN_BLOCK_N", "16"))
-        _nw = int(os.environ.get("KVARN_NUM_WARPS", "4"))
-        _ns = int(os.environ.get("KVARN_NUM_STAGES", "2"))
         mid_o = torch.zeros(B * Hq, splits, D, dtype=torch.float32, device=device)
         mid_lse = torch.zeros(B * Hq, splits, dtype=torch.float32, device=device)
+        # stage1 is @triton.autotune'd; this warmup launch triggers its sweep
+        # here (pre-CUDA-graph-capture) so capture never benchmarks.
         _kvarn_fused_decode_stage1[(B, Hk, splits)](
             q, sl, bt, sl, b2s, cache, pool_k, pool_v, mid_o, mid_lse, self.scale,
             Hq * D, D, bt.stride(0), cache.stride(0), cache.stride(1),
             pool_k.stride(0), pool_k.stride(1), pool_k.stride(2),
             mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
-            BLOCK_N=_bn, NUM_KV_SPLITS=splits, HQ=Hq,
-            num_warps=_nw, num_stages=_ns, **common,
+            NUM_KV_SPLITS=splits, HQ=Hq, **common,
         )
         out2d = out.view(B * Hq, D)
         _kvarn_fused_decode_stage2[(B * Hq,)](
@@ -1302,8 +1300,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             Hq * D, D, bt.stride(0), cache.stride(0), cache.stride(1),
             pool_k.stride(0), pool_k.stride(1), pool_k.stride(2),
             mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
-            BLOCK_N=_bn, NUM_KV_SPLITS=splits, HQ=Hq,
-            num_warps=_nw, num_stages=_ns, **common_vq,
+            NUM_KV_SPLITS=splits, HQ=Hq, **common_vq,
         )
         # 2c. Shared-dequant verify kernel (uniform-QLEN spec verify) — runs
         # its @triton.autotune sweep here so capture never benchmarks. QLEN is

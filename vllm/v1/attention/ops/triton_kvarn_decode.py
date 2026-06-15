@@ -41,16 +41,15 @@ def adaptive_num_kv_splits(max_blocks_per_req: int) -> int:
 
     Depends only on the deployment's max_model_len (via max_blocks_per_req =
     ceil(max_model_len/group)), so it is CONSTANT per deployment -> CUDA-graph
-    safe and changes nothing for short-context deployments. The fixed 16
-    under-parallelized the stage-1 grid at long context + low batch (Qwen3.6-27B
-    burst@16K: 0.75x bf16 at 16 vs 1.10x at 32). KVARN_NUM_KV_SPLITS overrides.
-    Split-K is log-sum-exp-combined, so the count never changes the OUTPUT, only
-    occupancy: <=80 blocks (~<=10K ctx) keeps the tuned 16, longer bumps up."""
+    safe and changes nothing for short-context deployments. 16 split under-
+    parallelized the stage-1 (B, Hk, SPLITS) grid at low batch: the single-token
+    decode microbench (Qwen3-4B, ctx 4.6K) measured 37us at 16 vs ~27us at 32,
+    a ~28% stage-1 win, growing at longer ctx (16K: 82->49us). Split-K is
+    log-sum-exp-combined, so the count never changes the OUTPUT, only occupancy;
+    32 is the floor up to 256 blocks. KVARN_NUM_KV_SPLITS overrides."""
     env = os.environ.get("KVARN_NUM_KV_SPLITS")
     if env is not None:
         return int(env)
-    if max_blocks_per_req <= 80:
-        return 16
     if max_blocks_per_req <= 256:
         return 32
     return KVARN_MAX_KV_SPLITS
@@ -464,9 +463,8 @@ def _kvarn_pool_gather_packed_kernel(  # noqa: SUPERSEDED by _kvarn_build_packed
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_N": 16}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=2)
+        for bn in (16, 32, 64) for nw in (2, 4)
     ],
     key=["D", "GROUP", "Q_PER_KV", "K_BITS", "V_BITS"],
 )
@@ -650,6 +648,20 @@ def _kvarn_fused_decode_kernel(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# AUTO-TUNED across BLOCK_N x num_warps x num_stages (keyed per model arch ×
+# quant config, like the single-stage kernel). Stage1 was previously launched
+# with a hardcoded BLOCK_N=16 / num_warps=4; the microbench (Qwen3-4B) showed
+# BLOCK_N=32 / num_warps=2 is ~25-40% faster across 4.6K-32K ctx. Split-K is
+# LSE-combined so BLOCK_N never affects the output. Warmed in
+# _warm_decode_kernels (pre-CUDA-graph-capture), so autotune never triggers
+# mid-capture.
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=2)
+        for bn in (16, 32, 64) for nw in (2, 4)
+    ],
+    key=["D", "GROUP", "Q_PER_KV", "K_BITS", "V_BITS"],
+)
 @triton.jit
 def _kvarn_fused_decode_stage1(
     Q_ptr, Req_row_ptr, Block_table_ptr, Seq_lens_ptr, Block_to_slot_ptr,
@@ -865,12 +877,9 @@ def kvarn_decode_attention(
     #                FP16 KV traffic; kept for A/B and as a fallback).
     max_blocks_per_req = md.fa_max_blocks_per_req
     use_fused = os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
-    # Single-stage kernel is @triton.autotune'd over BLOCK_N (keyed on
-    # D/GROUP/Q_PER_KV/K_BITS/V_BITS) — no BLOCK_N/num_warps/num_stages here.
-    # Split-K path (stage1) keeps explicit knobs for the rare low-batch regime.
-    _bn = int(os.environ.get("KVARN_BLOCK_N", "16"))
-    _nw = int(os.environ.get("KVARN_NUM_WARPS", "4"))
-    _ns = int(os.environ.get("KVARN_NUM_STAGES", "2"))
+    # Both the single-stage kernel and stage1 are @triton.autotune'd over
+    # BLOCK_N/num_warps (keyed on D/GROUP/Q_PER_KV/K_BITS/V_BITS) — no
+    # BLOCK_N/num_warps/num_stages passed at the launch sites.
     _qpk = Hq // Hk
     # Pad Q_PER_KV to a power of 2 for tl.arange / tl.dot (e.g. Qwen3.5 GQA
     # 24q/4kv = ratio 6 -> 8); padded query heads are masked off in-kernel.
@@ -946,8 +955,7 @@ def kvarn_decode_attention(
                 kv_cache.stride(0), kv_cache.stride(1),
                 impl._tail_K_pool.stride(0), impl._tail_K_pool.stride(1), impl._tail_K_pool.stride(2),
                 mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
-                BLOCK_N=_bn, NUM_KV_SPLITS=SPLITS, HQ=Hq,
-                num_warps=_nw, num_stages=_ns, **common,
+                NUM_KV_SPLITS=SPLITS, HQ=Hq, **common,  # BLOCK_N/warps autotuned
             )
         with torch.profiler.record_function("kvarn_fused_decode_s2"):
             _kvarn_fused_decode_stage2[(N,)](
@@ -1128,9 +1136,6 @@ def kvarn_verify_attention(
         SPLITS = adaptive_num_kv_splits(max_ctx_blocks)
         mid_o = torch.empty(Nrows, SPLITS, D, dtype=torch.float32, device=device)
         mid_lse = torch.empty(Nrows, SPLITS, dtype=torch.float32, device=device)
-        _bn = int(os.environ.get("KVARN_BLOCK_N", "16"))
-        _nw = int(os.environ.get("KVARN_NUM_WARPS", "4"))
-        _ns = int(os.environ.get("KVARN_NUM_STAGES", "2"))
         _kvarn_fused_decode_stage1[(NQ, Hk, SPLITS)](
             q_rot, vq_req, block_table, vq_seqlen,
             impl._block_to_slot_t,
@@ -1141,8 +1146,7 @@ def kvarn_verify_attention(
             impl._tail_K_pool.stride(0), impl._tail_K_pool.stride(1),
             impl._tail_K_pool.stride(2),
             mid_o.stride(0), mid_o.stride(1), mid_lse.stride(0),
-            BLOCK_N=_bn, NUM_KV_SPLITS=SPLITS, HQ=Hq,
-            num_warps=_nw, num_stages=_ns, **common,
+            NUM_KV_SPLITS=SPLITS, HQ=Hq, **common,  # BLOCK_N/warps autotuned
         )
         out_flat = out_rot.view(Nrows, D)
         _kvarn_fused_decode_stage2[(Nrows,)](
@@ -1171,9 +1175,8 @@ def kvarn_verify_attention(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_N": 16}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=2)
+        for bn in (16, 32, 64) for nw in (2, 4)
     ],
     key=["D", "GROUP", "Q_PER_KV", "QLEN", "K_BITS", "V_BITS"],
 )
