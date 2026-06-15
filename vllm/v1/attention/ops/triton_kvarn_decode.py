@@ -34,6 +34,23 @@ from vllm.triton_utils import tl, triton
 KVARN_NUM_KV_SPLITS = int(os.environ.get("KVARN_NUM_KV_SPLITS", "16"))
 KVARN_MAX_KV_SPLITS = 64  # cap of the context-adaptive schedule below
 
+# Shared autotune space for the decode kernels (single-token, split-K stage1,
+# and spec-verify). ncu on the burst single-stage kernel showed it pinned at
+# ~25% occupancy (register-limited to 3 blocks/SM) and bottlenecked on L1/TEX
+# transaction rate, not DRAM bandwidth. So beyond BLOCK_N x num_warps we let the
+# autotuner trade pipelining for occupancy: num_stages=1 (no pipeline buffers,
+# fewer registers) and a couple of maxnreg caps (more resident blocks to hide
+# the L1 latency). The autotuner keeps whichever is fastest per shape, so this
+# is pure upside; online-softmax / split-K make the output reduction-order
+# invariant (fp noise only), independent of the config chosen.
+_DECODE_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=ns)
+    for bn in (16, 32, 64) for nw in (2, 4) for ns in (1, 2)
+] + [
+    triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2, maxnreg=mr)
+    for mr in (64, 96)
+]
+
 
 def adaptive_num_kv_splits(max_blocks_per_req: int) -> int:
     """Context-adaptive split-K count (single source of truth for the decode
@@ -462,10 +479,7 @@ def _kvarn_pool_gather_packed_kernel(  # noqa: SUPERSEDED by _kvarn_build_packed
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=2)
-        for bn in (16, 32, 64) for nw in (2, 4)
-    ],
+    configs=_DECODE_AUTOTUNE_CONFIGS,
     key=["D", "GROUP", "Q_PER_KV", "K_BITS", "V_BITS"],
 )
 @triton.jit
@@ -656,10 +670,7 @@ def _kvarn_fused_decode_kernel(
 # _warm_decode_kernels (pre-CUDA-graph-capture), so autotune never triggers
 # mid-capture.
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=2)
-        for bn in (16, 32, 64) for nw in (2, 4)
-    ],
+    configs=_DECODE_AUTOTUNE_CONFIGS,
     key=["D", "GROUP", "Q_PER_KV", "K_BITS", "V_BITS"],
 )
 @triton.jit
@@ -1174,10 +1185,7 @@ def kvarn_verify_attention(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=2)
-        for bn in (16, 32, 64) for nw in (2, 4)
-    ],
+    configs=_DECODE_AUTOTUNE_CONFIGS,
     key=["D", "GROUP", "Q_PER_KV", "QLEN", "K_BITS", "V_BITS"],
 )
 @triton.jit
