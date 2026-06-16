@@ -1194,7 +1194,18 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # single-stage kernel if N ever exceeds the buffer rows (defensive —
         # e.g. an oversized padded dummy batch).
         _splits = adaptive_num_kv_splits((self._max_model_len + cfg.group - 1) // cfg.group)
-        mid_rows = max(self._max_num_seqs * Hq, 1)
+        # Rows are bounded by the split-K REGIME, not max_num_seqs: the driver
+        # only takes split-K when B*Hk <= sm_count (otherwise the single-stage
+        # kernel runs), so the most rows it can ever index is (sm_count//Hk)*Hq
+        # = sm_count*Q_PER_KV, independent of max_num_seqs. Sizing to
+        # max_num_seqs*Hq over-reserved this fp32 partial buffer ~10-20x at high
+        # concurrency, where it competes directly with the int4 KV cache. The
+        # driver still falls back to single-stage if N ever exceeds these rows
+        # (defensive), and split-K is never disabled for a batch it would take
+        # (B*Hk<=sm_count => N=B*Hq <= (sm_count//Hk)*Hq).
+        _sm = (getattr(self, "_sm_count", 0)
+               or torch.cuda.get_device_properties(device).multi_processor_count)
+        mid_rows = max((_sm // max(Hk, 1)) * Hq, Hq, 1)
         _ex_mid = cls._shared_mid_o_buf.get(bkey)
         if _ex_mid is None or _ex_mid.shape[0] < mid_rows or _ex_mid.shape[1] != _splits:
             cls._shared_mid_o_buf[bkey] = torch.empty(mid_rows, _splits, D, dtype=torch.float32, device=device)
