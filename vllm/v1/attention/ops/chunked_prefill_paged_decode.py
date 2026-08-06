@@ -37,6 +37,14 @@ def has_native_kv_cache_layout(
     )
 
 
+def _has_64k_lds() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import has_64k_lds
+
+    return has_64k_lds()
+
+
 @triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y
@@ -366,7 +374,10 @@ def chunked_prefill_paged_decode(
         key_cache = key_cache.view(target_dtype)
         value_cache = value_cache.view(target_dtype)
 
-    num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
+    if _has_64k_lds():
+        num_queries_per_kv_padded = triton.next_power_of_2(num_queries_per_kv)
+    else:
+        num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
 
     from vllm.platforms.rocm import use_rocm_custom_paged_attention
 
@@ -388,6 +399,14 @@ def chunked_prefill_paged_decode(
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
     if not is_pow2 or not has_native_layout:
         use_custom = False
+
+    triton_launch_kwargs = {}
+    if _has_64k_lds():
+        triton_launch_kwargs = {
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 1,
+        }
 
     if use_custom:
         _PARTITION_SIZE_ROCM = 256
@@ -504,4 +523,5 @@ def chunked_prefill_paged_decode(
             query_start_len_ptr=query_start_loc,
             USE_SINKS=sinks is not None,
             USE_FP8=output_scale is not None,
+            **triton_launch_kwargs,
         )

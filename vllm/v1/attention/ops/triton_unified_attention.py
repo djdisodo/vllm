@@ -781,6 +781,14 @@ def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
     return sliding_window == 1024 and head_size in (128, 256)
 
 
+def _has_64k_lds() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import has_64k_lds
+
+    return has_64k_lds()
+
+
 def _get_tile_size(
     head_size: int,
     sliding_window: int,
@@ -794,7 +802,7 @@ def _get_tile_size(
 
     # Default behavior
     if is_prefill:
-        return 32
+        return 16 if _has_64k_lds() else 32
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
     return 16 if element_size >= 2 else 32
 
