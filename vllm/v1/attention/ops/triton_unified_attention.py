@@ -336,6 +336,7 @@ def kernel_unified_attention(
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    query_head_mask = offs_m < BLOCK_Q * num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
@@ -347,7 +348,9 @@ def kernel_unified_attention(
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
-    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+    query_mask_1 = (
+        (query_offset_1 < num_query_heads) & query_head_mask
+    ).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
     if USE_TD_QO:
