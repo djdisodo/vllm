@@ -279,11 +279,13 @@ class SpecDecodeBaseProposer:
             from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
                 ROCMAiterMLASparseMetadata,
             )
+            from vllm.v1.attention.backends.kvarn_attn import KVarNMetadata
             from vllm.v1.attention.backends.rocm_attn import RocmAttentionMetadata
 
             rocm_types = [
                 TritonAttentionMetadata,
                 RocmAttentionMetadata,
+                KVarNMetadata,
                 ROCMAiterMLASparseMetadata,
                 DeepseekV4ROCMAiterMLASparseMetadata,
                 DeepseekV4ROCMAiterSparseSWAMetadata,
