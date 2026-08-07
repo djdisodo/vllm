@@ -26,6 +26,7 @@ import os
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 # Number of KV-sequence splits for the split-K flash-decoding kernel. More
@@ -39,17 +40,19 @@ KVARN_MAX_KV_SPLITS = 64  # cap of the context-adaptive schedule below
 # ~25% occupancy (register-limited to 3 blocks/SM) and bottlenecked on L1/TEX
 # transaction rate, not DRAM bandwidth. So beyond BLOCK_N x num_warps we let the
 # autotuner trade pipelining for occupancy: num_stages=1 (no pipeline buffers,
-# fewer registers) and a couple of maxnreg caps (more resident blocks to hide
-# the L1 latency). The autotuner keeps whichever is fastest per shape, so this
-# is pure upside; online-softmax / split-K make the output reduction-order
-# invariant (fp noise only), independent of the config chosen.
+# fewer registers) and, where the backend supports it, a couple of maxnreg caps
+# (more resident blocks to hide the L1 latency). Triton 3.7 exposes
+# Config(maxnreg=...), but the ROCm backend does not accept maxnreg as a HIP
+# compile option, so keep those variants off ROCm.
 _DECODE_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=ns)
     for bn in (16, 32, 64) for nw in (2, 4) for ns in (1, 2)
-] + [
-    triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2, maxnreg=mr)
-    for mr in (64, 96)
 ]
+if not current_platform.is_rocm():
+    _DECODE_AUTOTUNE_CONFIGS += [
+        triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2, maxnreg=mr)
+        for mr in (64, 96)
+    ]
 
 
 def adaptive_num_kv_splits(max_blocks_per_req: int) -> int:
