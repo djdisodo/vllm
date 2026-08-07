@@ -535,6 +535,7 @@ def _get_backend_priorities(
         backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
+    backends.append(AttentionBackendEnum.KVARN)
 
     if on_gfx906():
         backends.remove(AttentionBackendEnum.TRITON_ATTN)
@@ -965,6 +966,41 @@ class RocmPlatform(Platform):
 
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        if (
+            isinstance(cache_dtype, str)
+            and cache_dtype.startswith("kvarn_")
+            and not cache_dtype.startswith("kvarn_mla")
+            and not getattr(model_config, "use_mla", False)
+        ):
+            head_size = model_config.get_head_size() if model_config else None
+            # Dense KVarN supports head_dim 128 / 256 / 512. Reject other
+            # shapes at config time so ROCm fails the same way CUDA does.
+            if head_size is not None and head_size not in (128, 256, 512):
+                raise ValueError(
+                    f"{cache_dtype} requires head_dim in (128, 256, 512), but this "
+                    f"model has head_dim={head_size}; use a different "
+                    f"--kv-cache-dtype for this model."
+                )
+
+            skip_layers = cache_config.kv_cache_dtype_skip_layers
+            _quant_sliding = os.environ.get("KVARN_QUANT_SLIDING") == "1"
+            if _quant_sliding:
+                while "sliding_window" in skip_layers:
+                    skip_layers.remove("sliding_window")
+                logger.info("KVarN (%s): KVARN_QUANT_SLIDING=1 -- quantizing "
+                            "sliding-window layers too.", cache_dtype)
+            elif "sliding_window" not in skip_layers:
+                skip_layers.append("sliding_window")
+                logger.info(
+                    "KVarN (%s): sliding-window attention layers (if any) are "
+                    "kept in full precision; KVarN compresses full-attention "
+                    "layers only.",
+                    cache_dtype,
+                )
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
