@@ -84,6 +84,8 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
         kv_cache_dtype.startswith("fp8")
         or kv_cache_dtype.endswith("per_token_head")
         or kv_cache_dtype.startswith("nvfp4")
+        or kv_cache_dtype.startswith("kvarn_")
+        or kv_cache_dtype.startswith("turboquant_")
     )
 
 
