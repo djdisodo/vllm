@@ -1132,7 +1132,7 @@ def instanttensor_weights_iterator(
         framework="pt",
         device=device,
         process_group=process_group,
-        copy=True,
+        copy=envs.VLLM_INSTANTTENSOR_COPY,
     ) as f:
         # Track bytes so the bar reports load throughput (GB/s).
         pbar = tqdm(

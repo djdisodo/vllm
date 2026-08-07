@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
+    VLLM_INSTANTTENSOR_COPY: bool = True
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
@@ -1110,6 +1111,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at peak during loading.
     "VLLM_FASTSAFETENSORS_QUEUE_SIZE": lambda: int(
         os.getenv("VLLM_FASTSAFETENSORS_QUEUE_SIZE", "0")
+    ),
+    # Whether InstantTensor should clone yielded tensors so they own storage.
+    # Keep the upstream-safe default; setting this to 0 is useful for
+    # memory-constrained loads whose model loaders consume weights inline.
+    "VLLM_INSTANTTENSOR_COPY": lambda: bool(
+        int(os.getenv("VLLM_INSTANTTENSOR_COPY", "1"))
     ),
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
