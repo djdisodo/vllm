@@ -647,8 +647,47 @@ class Platform:
         # Phase 3: Align block/page sizes when multiple KV dtypes share the
         # block pool (e.g. nvfp4 primary + unquantized skip layers).
         # May override the user's --block-size.
-        if cache_config.kv_cache_dtype_skip_layers:
+        if cls._kv_cache_dtype_skip_layers_may_match(vllm_config):
             cls._align_heterogeneous_kv_block_size(vllm_config, backend_cls)
+
+    @classmethod
+    def _kv_cache_dtype_skip_layers_may_match(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> bool:
+        """Return whether skip-layer selectors may produce native KV specs.
+
+        ``kv_cache_dtype_skip_layers`` is a selector list, not a resolved list
+        of skipped specs. In particular, ROCm KVarN installs the
+        ``"sliding_window"`` selector defensively, but hybrid models such as
+        Qwen3.6 have linear-attention + full-attention layers and no
+        sliding-window attention layers. Treating that unmatched selector as a
+        boolean "there are skipped native specs" over-aligns Mamba pages before
+        the actual layer specs are built.
+        """
+        cache_config = vllm_config.cache_config
+        selectors = cache_config.kv_cache_dtype_skip_layers
+        if not selectors:
+            return False
+
+        # Numeric selectors name concrete layer indices. Unknown future
+        # selectors keep the old conservative behavior.
+        non_sliding = [s for s in selectors if s != "sliding_window"]
+        if non_sliding:
+            return True
+
+        model_config = vllm_config.model_config
+        if model_config is None:
+            return True
+
+        text_config = model_config.hf_text_config
+        layer_types = getattr(text_config, "layer_types", None)
+        if layer_types is not None:
+            return any(t == "sliding_attention" for t in layer_types)
+
+        # Without per-layer metadata, a model-level sliding window can apply to
+        # attention layers, so the selector may match.
+        return cache_config.sliding_window is not None
 
     @classmethod
     def _align_heterogeneous_kv_block_size(
@@ -828,7 +867,7 @@ class Platform:
                 kv_quant_mode=kv_quant_mode,
                 tq_slot_size=tq_cfg.slot_size_aligned,
             ).page_size_bytes
-            if cache_config.kv_cache_dtype_skip_layers:
+            if cls._kv_cache_dtype_skip_layers_may_match(vllm_config):
                 skip_page = FullAttentionSpec(
                     block_size=1,
                     num_kv_heads=model_config.get_num_kv_heads(parallel_config),

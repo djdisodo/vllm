@@ -940,6 +940,20 @@ class RocmPlatform(Platform):
         compilation_config.custom_ops.append("+sparse_attn_indexer")
 
     @classmethod
+    def _model_may_have_sliding_window_attention(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> bool:
+        model_config = vllm_config.model_config
+        if model_config is None:
+            return True
+        text_config = model_config.hf_text_config
+        layer_types = getattr(text_config, "layer_types", None)
+        if layer_types is not None:
+            return any(t == "sliding_attention" for t in layer_types)
+        return vllm_config.cache_config.sliding_window is not None
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         from vllm.config.compilation import CUDAGraphMode
 
@@ -993,7 +1007,10 @@ class RocmPlatform(Platform):
                     skip_layers.remove("sliding_window")
                 logger.info("KVarN (%s): KVARN_QUANT_SLIDING=1 -- quantizing "
                             "sliding-window layers too.", cache_dtype)
-            elif "sliding_window" not in skip_layers:
+            elif (
+                cls._model_may_have_sliding_window_attention(vllm_config)
+                and "sliding_window" not in skip_layers
+            ):
                 skip_layers.append("sliding_window")
                 logger.info(
                     "KVarN (%s): sliding-window attention layers (if any) are "

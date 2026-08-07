@@ -5,6 +5,9 @@
 import math
 import os
 from dataclasses import dataclass
+from typing import Literal
+
+KVarNSlotAlignment = Literal["compat", "tight"]
 
 # Named KVarN presets: each maps to a frozen set of config parameters.
 # The trailing g<N> encodes the variance-normalization tile size, which must
@@ -64,6 +67,7 @@ class KVarNConfig:
     sinkhorn_iters: int = 8         # converges by ~4 iters; 8 lossless vs 16 (validated Qwen3-4B + Qwen3.6-27B AIME)
     sink_tokens: int = 128          # first N tokens per request stay fp16 (NEVER quantised)
     boundary_skip_layers: int = 0   # layer-level skipping off by default; sink_tokens replaces it
+    slot_alignment: KVarNSlotAlignment = "compat"
 
     # ── derived: storage layout ──────────────────────────────────────────────
     @property
@@ -110,16 +114,22 @@ class KVarNConfig:
     def tile_bytes_aligned(self) -> int:
         """tile_bytes rounded up for nicer Triton loads.
 
-        For head_dim >= 256 we round the PER-TOKEN slot (tile_bytes / group) up to
-        a power of 2. This is required for models with heterogeneous head_dim
-        (e.g. Gemma-4: 256 sliding-window layers + 512 global layers): the raw
-        slot has a fixed per-token-group scale term that doesn't scale with D, so
-        slot(512)/slot(256) is not an integer and vLLM's KV-cache page-size
-        unification (which scales block_size by that ratio) fails. Power-of-2 slots
-        make the ratio an exact power of 2. head_dim<=128 keeps the tight 8-byte
-        alignment (the common case; no padding). Trailing pad only — offsets are
-        unchanged, so the layout/kernels are byte-compatible."""
-        if self.head_dim >= 256:
+        In compatibility mode, head_dim >= 256 rounds the PER-TOKEN slot
+        (tile_bytes / group) up to a power of 2. This is required for models
+        with heterogeneous head_dim (e.g. Gemma-4: 256 sliding-window layers +
+        512 global layers): the raw slot has a fixed per-token-group scale term
+        that doesn't scale with D, so slot(512)/slot(256) is not an integer and
+        vLLM's KV-cache page-size unification fails. Power-of-2 slots make the
+        ratio an exact power of 2.
+
+        Homogeneous large-head models such as Qwen3.6 pay a large price for
+        that compatibility padding: k4v4_g128 at D=256 is 35072 bytes/tile, but
+        the power-of-2 rule expands it to 65536 bytes/tile. Tight mode keeps
+        only 8-byte trailing alignment, which restores the intended compression
+        when all KVarN attention layers have compatible page sizes. Offsets are
+        unchanged, so the layout/kernels are byte-compatible apart from the
+        shorter trailing pad."""
+        if self.slot_alignment == "compat" and self.head_dim >= 256:
             slot = math.ceil(self.tile_bytes / self.group)
             slot_pow2 = 1 << (slot - 1).bit_length()
             return slot_pow2 * self.group
@@ -329,6 +339,30 @@ class KVarNConfig:
         return [str(i) for i in sorted(set(first + last))]
 
     @staticmethod
+    def get_slot_alignment() -> KVarNSlotAlignment:
+        """Return the KVarN tile padding policy.
+
+        ``compat`` preserves upstream's power-of-two slot padding for large
+        heads. ``tight`` removes that compatibility padding and keeps only
+        8-byte trailing alignment; use it only when the model's KVarN layers can
+        be unified without generic page padding.
+        """
+        value = os.environ.get("KVARN_SLOT_ALIGNMENT", "compat").lower()
+        aliases = {
+            "compat": "compat",
+            "power2": "compat",
+            "padded": "compat",
+            "tight": "tight",
+        }
+        try:
+            return aliases[value]  # type: ignore[return-value]
+        except KeyError as exc:
+            raise ValueError(
+                "KVARN_SLOT_ALIGNMENT must be 'compat' or 'tight' "
+                f"(got {value!r})."
+            ) from exc
+
+    @staticmethod
     def from_cache_dtype(cache_dtype: str, head_dim: int) -> "KVarNConfig":
         """Create a config from a preset string like ``"kvarn_k4v4"``."""
         if cache_dtype not in KVARN_PRESETS:
@@ -349,4 +383,5 @@ class KVarNConfig:
             group=preset["group"],
             sinkhorn_iters=iters,
             sink_tokens=sink_tokens,
+            slot_alignment=KVarNConfig.get_slot_alignment(),
         )
