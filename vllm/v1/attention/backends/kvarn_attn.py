@@ -352,6 +352,15 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             self._max_model_len = vllm_config.model_config.max_model_len
         except Exception:
             self._max_model_len = 4096
+        try:
+            self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        except Exception:
+            self._max_num_seqs = 256
+        try:
+            self._max_num_batched_tokens = (
+                vllm_config.scheduler_config.max_num_batched_tokens)
+        except Exception:
+            self._max_num_batched_tokens = 8192
 
         # KVarN tile / group size (= vLLM block size). Sourced from the configured
         # kv-cache dtype so non-128 groups (e.g. g64) drive the flush + slot math
@@ -379,6 +388,35 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         self._vq_seqlen_buf: torch.Tensor | None = None
         self._vq_req_host: torch.Tensor | None = None
         self._vq_seqlen_host: torch.Tensor | None = None
+        self._init_static_buffers(device)
+
+    def _init_static_buffers(self, device: torch.device) -> None:
+        """Allocate builder-owned metadata buffers at construction time.
+
+        vLLM's scheduler caps requests and batched tokens, so these sizes are
+        fixed for the lifetime of the worker. Growing them from build() would
+        create serving-time allocations that are invisible to the initial KVarN
+        memory profile.
+        """
+        seq_cap = max(int(self._max_num_seqs) + 1, 1)
+        token_cap = max(int(self._max_num_batched_tokens),
+                        int(self._max_num_seqs), 1)
+        self._cu_seqlens_q_buf = torch.empty(
+            seq_cap, dtype=torch.int32, device=device)
+        self._cu_seqlens_k_buf = torch.empty(
+            seq_cap, dtype=torch.int32, device=device)
+        self._cu_seqlens_q_host = torch.empty(
+            seq_cap, dtype=torch.int32, pin_memory=True)
+        self._cu_seqlens_k_host = torch.empty(
+            seq_cap, dtype=torch.int32, pin_memory=True)
+        self._vq_req_buf = torch.empty(
+            token_cap, dtype=torch.int32, device=device)
+        self._vq_seqlen_buf = torch.empty(
+            token_cap, dtype=torch.int32, device=device)
+        self._vq_req_host = torch.empty(
+            token_cap, dtype=torch.int32, pin_memory=True)
+        self._vq_seqlen_host = torch.empty(
+            token_cap, dtype=torch.int32, pin_memory=True)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -698,11 +736,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # in fixed buffers updated in place — not recreated each step.
         cap = B + 1
         if self._cu_seqlens_q_buf is None or self._cu_seqlens_q_buf.shape[0] < cap:
-            new_cap = max(cap, 257)   # default max_num_seqs headroom
-            self._cu_seqlens_q_buf = torch.empty(new_cap, dtype=torch.int32, device=device)
-            self._cu_seqlens_k_buf = torch.empty(new_cap, dtype=torch.int32, device=device)
-            self._cu_seqlens_q_host = torch.empty(new_cap, dtype=torch.int32, pin_memory=True)
-            self._cu_seqlens_k_host = torch.empty(new_cap, dtype=torch.int32, pin_memory=True)
+            raise RuntimeError(
+                "KVarN static cu_seqlens buffer too small: "
+                f"need {cap}, have "
+                f"{0 if self._cu_seqlens_q_buf is None else self._cu_seqlens_q_buf.shape[0]}. "
+                "Increase scheduler max_num_seqs before startup.")
         for i in range(B + 1):
             self._cu_seqlens_q_host[i] = i
             self._cu_seqlens_k_host[i] = cu_seqlens_k_h[i]
@@ -723,15 +761,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         if num_decodes > 0 and num_decode_tokens > num_decodes:
             if (self._vq_req_buf is None
                     or self._vq_req_buf.shape[0] < num_decode_tokens):
-                vq_cap = max(num_decode_tokens, 4096)
-                self._vq_req_buf = torch.empty(
-                    vq_cap, dtype=torch.int32, device=device)
-                self._vq_seqlen_buf = torch.empty(
-                    vq_cap, dtype=torch.int32, device=device)
-                self._vq_req_host = torch.empty(
-                    vq_cap, dtype=torch.int32, pin_memory=True)
-                self._vq_seqlen_host = torch.empty(
-                    vq_cap, dtype=torch.int32, pin_memory=True)
+                raise RuntimeError(
+                    "KVarN static verify-plan buffer too small: "
+                    f"need {num_decode_tokens}, have "
+                    f"{0 if self._vq_req_buf is None else self._vq_req_buf.shape[0]}. "
+                    "Increase scheduler max_num_batched_tokens before startup.")
             i = 0
             uniform = query_lens_cpu[0] if num_decodes else 0
             for b in range(num_decodes):
@@ -839,6 +873,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _shared_mid_lse_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_fa_K_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_fa_V_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_prefill_out_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
 
     # ── Stage α-2: class-level shared sparse slot allocator ──────────────────
     # Single source of truth across all 28 KVarNAttentionImpl instances:
@@ -973,6 +1008,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._mid_lse_buf: torch.Tensor | None = None
         self._fa_K_buf: torch.Tensor | None = None
         self._fa_V_buf: torch.Tensor | None = None
+        self._prefill_out_buf: torch.Tensor | None = None
 
         self.fa_version = get_flash_attn_version(head_size=head_size)
 
@@ -1182,6 +1218,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cls._shared_out_rot_fp32_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
             cls._shared_output_fp32_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float32, device=device)
             cls._shared_fused_out_buf[bkey] = torch.empty(q_rows, D, dtype=torch.float16, device=device)
+            cls._shared_prefill_out_buf[bkey] = torch.empty(q_rows, Hq, D, dtype=torch.float16, device=device)
         from vllm.v1.attention.ops.triton_kvarn_decode import adaptive_num_kv_splits
         # Split-K partial buffers, sized to EXACTLY what the split-K decode path
         # can index: it runs ONLY on pure single-query decode steps, whose row
@@ -1224,6 +1261,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._mid_lse_buf = cls._shared_mid_lse_buf[bkey]
         self._fa_K_buf = cls._shared_fa_K_buf[bkey]
         self._fa_V_buf = cls._shared_fa_V_buf[bkey]
+        self._prefill_out_buf = cls._shared_prefill_out_buf[bkey]
     def _warm_decode_kernels(self, device: torch.device) -> None:
         """Compile + autotune every decode-path Triton kernel on tiny synthetic
         state (see the issue #10 note at the call site in ``_ensure_pool``).
@@ -1888,7 +1926,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 max_k=attn_metadata.max_query_len,
             )
         # Per-request SDPA fallback (e.g. when flash_attn isn't available).
-        outputs = []
+        # KVarN owns the output staging buffer, but PyTorch's SDPA workspace is
+        # still internal to PyTorch; controlling that requires a native prefill
+        # kernel or a working flash-attn varlen backend.
+        if self._prefill_out_buf is None or self._prefill_out_buf.shape[0] < q.shape[0]:
+            raise RuntimeError(
+                "KVarN static prefill output buffer too small: "
+                f"need {q.shape[0]}, have "
+                f"{0 if self._prefill_out_buf is None else self._prefill_out_buf.shape[0]}. "
+                "Increase scheduler max_num_batched_tokens before startup.")
+        out = self._prefill_out_buf[:q.shape[0]]
         qsl = attn_metadata.query_start_loc.tolist()
         for r in range(len(qsl) - 1):
             qs, qe = qsl[r], qsl[r + 1]
@@ -1901,10 +1948,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 q_r, k_r, v_r, is_causal=True, scale=self.scale,
                 enable_gqa=self.num_kv_heads < self.num_heads,
             )
-            outputs.append(o[0].transpose(0, 1))         # [q_len, Hq, D]
-        return torch.cat(outputs, dim=0) if outputs else torch.empty(
-            0, self.num_heads, self.head_size, device=q.device, dtype=q.dtype,
-        )
+            out[qs:qe] = o[0].transpose(0, 1).to(out.dtype)  # [q_len, Hq, D]
+        return out[:q.shape[0]].to(q.dtype)
 
     def _gather_request_kv(
         self, kv_cache: torch.Tensor, block_table_row: torch.Tensor, seq_len: int,
@@ -2224,11 +2269,15 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # (non-persistent) tensors are fine.
         group = self.kvarn_config.group
         dec_seq_lens = attn_metadata.seq_lens[:num_decodes].to(torch.int32)
-        dec_cu_k = torch.nn.functional.pad(
-            torch.cumsum(dec_seq_lens, dim=0), (1, 0)
-        ).to(torch.int32)
-        dec_cu_q = torch.arange(
-            num_decodes + 1, dtype=torch.int32, device=q.device
+        dec_cu_k = (
+            attn_metadata.fa_cu_seqlens_k[:num_decodes + 1]
+            if attn_metadata.fa_cu_seqlens_k is not None
+            else None
+        )
+        dec_cu_q = (
+            attn_metadata.fa_cu_seqlens_q[:num_decodes + 1]
+            if attn_metadata.fa_cu_seqlens_q is not None
+            else None
         )
         mbpr = (self._max_model_len + group - 1) // group
         decode_meta = KVarNMetadata(
