@@ -2193,7 +2193,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 and md.max_query_len
                 <= int(os.environ.get("KVARN_FUSED_VERIFY_MAXQ", "8"))
                 and (int(md.max_seq_len) + _group - 1) // _group
-                >= int(os.environ.get("KVARN_FUSED_VERIFY_MIN_BLOCKS", "64"))
+                >= int(os.environ.get("KVARN_FUSED_VERIFY_MIN_BLOCKS", "0"))
                 and B > 0):
             return self._fused_verify_path(q, kv_cache, md)
         if (not _HAS_FLASH_ATTN or self.head_size > 256
