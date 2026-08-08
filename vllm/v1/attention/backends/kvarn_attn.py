@@ -69,6 +69,7 @@ from vllm.v1.attention.ops.kvarn_store import (
     kvarn_store_tile_v_batch_from_sinkhorn,
 )
 from vllm.v1.attention.ops.triton_kvarn_decode import kvarn_decode_attention
+from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_kvarn_sinkhorn import kvarn_sinkhorn_triton
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
@@ -1925,10 +1926,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 max_q=attn_metadata.max_query_len,
                 max_k=attn_metadata.max_query_len,
             )
-        # Per-request SDPA fallback (e.g. when flash_attn isn't available).
-        # KVarN owns the output staging buffer, but PyTorch's SDPA workspace is
-        # still internal to PyTorch; controlling that requires a native prefill
-        # kernel or a working flash-attn varlen backend.
+        # vLLM's in-tree Triton prefill kernel accepts raw varlen Q/K/V and
+        # writes into caller-owned output. On ROCm/gfx906 this is the normal
+        # fallback when upstream flash-attn is not installed: it avoids PyTorch
+        # SDPA's hidden temporary workspace, so KV-cache sizing does not need to
+        # reserve for an unbounded SDPA allocation.
         if self._prefill_out_buf is None or self._prefill_out_buf.shape[0] < q.shape[0]:
             raise RuntimeError(
                 "KVarN static prefill output buffer too small: "
@@ -1936,19 +1938,19 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 f"{0 if self._prefill_out_buf is None else self._prefill_out_buf.shape[0]}. "
                 "Increase scheduler max_num_batched_tokens before startup.")
         out = self._prefill_out_buf[:q.shape[0]]
-        qsl = attn_metadata.query_start_loc.tolist()
-        for r in range(len(qsl) - 1):
-            qs, qe = qsl[r], qsl[r + 1]
-            if qe <= qs:
-                continue
-            q_r = q[qs:qe].transpose(0, 1).unsqueeze(0)  # [1, Hq, q_len, D]
-            k_r = k[qs:qe].transpose(0, 1).unsqueeze(0)
-            v_r = v[qs:qe].transpose(0, 1).unsqueeze(0)
-            o = F.scaled_dot_product_attention(
-                q_r, k_r, v_r, is_causal=True, scale=self.scale,
-                enable_gqa=self.num_kv_heads < self.num_heads,
-            )
-            out[qs:qe] = o[0].transpose(0, 1).to(out.dtype)  # [q_len, Hq, D]
+        context_attention_fwd(
+            q=q,
+            k=k,
+            v=v,
+            o=out,
+            b_start_loc=attn_metadata.query_start_loc,
+            b_seq_len=attn_metadata.seq_lens,
+            max_input_len=attn_metadata.max_query_len,
+            is_causal=True,
+            softmax_scale=self.scale,
+            sliding_window_q=self.sliding_window,
+            sliding_window_k=0,
+        )
         return out[:q.shape[0]].to(q.dtype)
 
     def _gather_request_kv(
