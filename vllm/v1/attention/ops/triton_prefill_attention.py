@@ -285,3 +285,216 @@ def context_attention_fwd(
         num_stages=1,
         Lk=Lk,
     )
+
+
+@triton.jit
+def _fwd_kernel_with_kv_lens(
+    Q,
+    K,
+    V,
+    Sinks,
+    sm_scale,
+    Q_Start_Loc,
+    K_Start_Loc,
+    B_Seqlen,
+    Out,
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_obs,
+    stride_oh,
+    kv_group_num: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SLIDING_WINDOW_Q: tl.constexpr,
+    SLIDING_WINDOW_K: tl.constexpr,
+    USE_SINKS: tl.constexpr,
+    Lk: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    start_m = tl.program_id(2)
+
+    cur_kv_head = cur_head // kv_group_num
+    q_start = tl.load(Q_Start_Loc + cur_batch)
+    q_end = tl.load(Q_Start_Loc + cur_batch + 1)
+    k_start = tl.load(K_Start_Loc + cur_batch)
+    seq_len = tl.load(B_Seqlen + cur_batch)
+    query_len = q_end - q_start
+    cached_len = seq_len - query_len
+
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_d = offs_d < Lk
+
+    off_q = (
+        (q_start + offs_m[:, None]) * stride_qbs
+        + cur_head * stride_qh
+        + offs_d[None, :]
+    )
+    q = tl.load(
+        Q + off_q,
+        mask=(offs_m[:, None] < query_len) & mask_d[None, :],
+        other=0.0,
+    )
+
+    off_k = offs_n[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None]
+    off_v = offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :]
+    k_ptrs = K + off_k
+    v_ptrs = V + off_v
+
+    if USE_SINKS:
+        sink = tl.load(Sinks + cur_head) * 1.4426950408889634
+        m_i = tl.full([BLOCK_M], sink, dtype=tl.float32)
+        l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    else:
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
+    block_start_loc = BLOCK_M * start_m
+    block_mask = tl.where(block_start_loc < query_len, 1, 0)
+    end_n = seq_len
+    if IS_CAUSAL:
+        end_n = tl.minimum(end_n, cached_len + (start_m + 1) * BLOCK_M)
+
+    start_n_limit = 0
+    if SLIDING_WINDOW_Q > 0:
+        first_needed = cached_len + start_m * BLOCK_M - SLIDING_WINDOW_Q
+        start_n_limit = tl.maximum(0, (first_needed // BLOCK_N) * BLOCK_N)
+    if SLIDING_WINDOW_K > 0:
+        last_needed = cached_len + (start_m + 1) * BLOCK_M - 1 + SLIDING_WINDOW_K
+        end_n = tl.minimum(end_n, last_needed + 1)
+    end_n_limit = block_mask * end_n
+
+    for start_n in range(start_n_limit, end_n_limit, BLOCK_N):
+        pos_q = cached_len + offs_m[:, None]
+        pos_k = start_n + offs_n[None, :]
+
+        mask = (pos_k < seq_len) & (offs_m[:, None] < query_len)
+        if IS_CAUSAL:
+            mask &= pos_q >= pos_k
+
+        sliding_mask_q = (
+            pos_q - pos_k <= SLIDING_WINDOW_Q if SLIDING_WINDOW_Q > 0 else None
+        )
+        sliding_mask_k = (
+            pos_k - pos_q <= SLIDING_WINDOW_K if SLIDING_WINDOW_K > 0 else None
+        )
+        if sliding_mask_q is not None:
+            mask &= sliding_mask_q
+        if sliding_mask_k is not None:
+            mask &= sliding_mask_k
+
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        k = tl.load(
+            k_ptrs + (k_start + start_n) * stride_kbs,
+            mask=(pos_k < seq_len) & mask_d[:, None],
+            other=0.0,
+        )
+        qk = tl.dot(q, k)
+        qk = tl.where(mask, qk * sm_scale, -1.0e8)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
+        v = tl.load(
+            v_ptrs + (k_start + start_n) * stride_vbs,
+            mask=((start_n + offs_n[:, None]) < seq_len) & mask_d[None, :],
+            other=0.0,
+        )
+        p = p.to(v.dtype)
+        acc = tl.dot(p, v, acc)
+        m_i = m_ij
+
+    acc = acc / l_i[:, None]
+    off_o = (
+        (q_start + offs_m[:, None]) * stride_obs
+        + cur_head * stride_oh
+        + offs_d[None, :]
+    )
+    tl.store(
+        Out + off_o,
+        acc,
+        mask=(offs_m[:, None] < query_len) & mask_d[None, :],
+    )
+
+
+def context_attention_fwd_with_kv_lens(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    q_start_loc: torch.Tensor,
+    k_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_query_len: int,
+    is_causal: bool = True,
+    softmax_scale: float | None = None,
+    sliding_window_q: int | None = None,
+    sliding_window_k: int | None = None,
+    sinks: torch.Tensor | None = None,
+    block_size: int | None = None,
+):
+    """
+    Attention for cached-continuation batches where q is packed separately from
+    full-sequence k/v. Causal positions are offset by seq_len - query_len, which
+    matches FlashAttention varlen's bottom-right causal semantics.
+    """
+    BLOCK = block_size if block_size is not None else get_block_size(q.dtype)
+
+    Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
+    sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
+    sm_scale *= RCP_LN2
+
+    batch, head = seq_lens.shape[0], q.shape[1]
+    kv_group_num = q.shape[1] // k.shape[1]
+    if sinks is not None:
+        assert sinks.shape[0] == head, "Sinks must be num_query_heads size"
+
+    grid = (batch, head, triton.cdiv(max_query_len, BLOCK))
+    num_warps = 4 if Lk <= 64 else 8
+
+    sliding_window_q = sliding_window_q if sliding_window_q is not None else 0
+    sliding_window_k = sliding_window_k if sliding_window_k is not None else 0
+
+    _fwd_kernel_with_kv_lens[grid](
+        q,
+        k,
+        v,
+        sinks if sinks is not None else q,
+        sm_scale,
+        q_start_loc,
+        k_start_loc,
+        seq_lens,
+        o,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        o.stride(0),
+        o.stride(1),
+        kv_group_num=kv_group_num,
+        BLOCK_M=BLOCK,
+        BLOCK_DMODEL=triton.next_power_of_2(Lk),
+        BLOCK_N=BLOCK,
+        IS_CAUSAL=is_causal,
+        SLIDING_WINDOW_Q=sliding_window_q,
+        SLIDING_WINDOW_K=sliding_window_k,
+        USE_SINKS=sinks is not None,
+        num_warps=num_warps,
+        num_stages=1,
+        Lk=Lk,
+    )
