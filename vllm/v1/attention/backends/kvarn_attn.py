@@ -1950,6 +1950,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             softmax_scale=self.scale,
             sliding_window_q=self.sliding_window,
             sliding_window_k=0,
+            # gfx906 has 64 KiB LDS. The generic Triton prefill default
+            # BLOCK=64 overflows shared memory at head_size=512; BLOCK=32 keeps
+            # the same streaming attention algorithm inside the hardware limit.
+            block_size=32 if self.head_size > 256 else None,
         )
         return out[:q.shape[0]].to(q.dtype)
 

@@ -228,6 +228,7 @@ def context_attention_fwd(
     sliding_window_k: int | None = None,
     sinks: torch.Tensor | None = None,
     sinks_bias_key0: bool = False,
+    block_size: int | None = None,
 ):
     """
     q, k, v: [b * s, head, head_dim]
@@ -235,7 +236,7 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    BLOCK = get_block_size(q.dtype)
+    BLOCK = block_size if block_size is not None else get_block_size(q.dtype)
 
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 
