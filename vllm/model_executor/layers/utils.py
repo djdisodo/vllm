@@ -200,7 +200,13 @@ def rocm_unquantized_gemm_impl(
             cu_count = num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])
-        elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
+        elif (
+            m % 4 == 0
+            and n == 1
+            and k <= 8192
+            and bias is None
+            and hasattr(torch.ops._rocm_C, "LLMM1")
+        ):
             out = ops.LLMM1(weight, x_view, 4)
             return out.reshape(*x.shape[:-1], weight.shape[0])
 
