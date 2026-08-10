@@ -1436,7 +1436,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         dec_key = ("decode", device, cfg.head_dim, cfg.group, cfg.key_bits,
                    cfg.value_bits, self.num_heads, self.num_kv_heads,
                    int(getattr(self, "sliding_window", 0) or 0))
-        if dec_key not in cls._kernel_warmed:
+        if (dec_key not in cls._kernel_warmed
+                and os.environ.get("KVARN_SKIP_DECODE_WARMUP", "0") != "1"):
             self._warm_decode_kernels(device)
             cls._kernel_warmed.add(dec_key)
 
