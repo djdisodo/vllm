@@ -140,6 +140,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.kvarn_attn import KVarNMetadataBuilder
 from vllm.v1.attention.backends.linear_attn import (
     BailingLinearAttentionMetadataBuilder,
 )
@@ -2562,6 +2563,7 @@ class GPUModelRunner(
                     Mamba2AttentionMetadataBuilder,
                     GDNAttentionMetadataBuilder,
                     BailingLinearAttentionMetadataBuilder,
+                    KVarNMetadataBuilder,
                 ),
             ):
                 assert ubid is None, (

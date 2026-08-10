@@ -273,12 +273,27 @@ class KVarNMetadata(AttentionMetadata):
     seq_lens_cpu: list[int] | None = None
     block_table_cpu: list[list[int]] | None = None
     slot_mapping_cpu: list[int] | None = None
+    query_start_locs_cpu: list[int] | None = None
+    query_lens_cpu: list[int] | None = None
+    # Slot mapping used by KVarN's fp16 pool store. During MTP verify, draft
+    # tokens are staged in the pool so accepted drafts remain available next
+    # step, but durable fill/flush accounting below only advances through
+    # committed tokens.
+    store_slot_mapping: torch.Tensor | None = None
+    store_slot_mapping_cpu: list[int] | None = None
+    # K/V lengths to materialize from persistent cache before appending current
+    # raw query K/V. Equals seq_lens except for speculative rows, where it is
+    # the committed prefix length (seq_len - query_len).
+    fa_build_seq_lens: torch.Tensor | None = None
+    has_transient_query_kv: bool = False
+    transient_query_kv_rows_cpu: list[bool] | None = None
     # Stage α-2 capture-correct decode metadata. The block_table-driven
     # build-packed-KV kernel reads block_table / seq_lens / fa_cu_seqlens_k
     # directly (all PERSISTENT buffers updated in-place by the builder), so a
     # captured CUDA graph sees fresh data on every replay.
     fa_cu_seqlens_q: torch.Tensor | None = None       # [B+1] int32 (persistent)
     fa_cu_seqlens_k: torch.Tensor | None = None       # [B+1] int32 (persistent prefix sum of seq_lens)
+    fa_cu_seqlens_k_cpu: list[int] | None = None
     fa_total_k: int = 0                               # last valid K_packed token offset
     fa_max_blocks_per_req: int = 0                    # ceil(max_model_len / group): grid dim
     fa_max_seqlen_k_fixed: int = 0                    # = max_model_len; fixed FA grid bound
@@ -293,20 +308,11 @@ class KVarNMetadata(AttentionMetadata):
 class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     """Builds ``KVarNMetadata`` from scheduler output."""
 
-    # UNIFORM_BATCH: spec-decode verify steps (uniform query length
-    # 1 + num_spec) are graph-capturable via the fused verify kernel — the
-    # whole MTP step replays as ONE full graph like vanilla FA, instead of
-    # ~num_layers eager attention calls between piecewise segments per step
-    # (the dominant MTP overhead once the materialize round-trip was gone;
-    # the gap to vanilla was 0.65-0.85x and worse under TP). All Python
-    # state mutation (slot allocation, sink marking, tile-boundary flush,
-    # the vq verify plan) happens in KVarNMetadataBuilder.build() between
-    # captured graph replays; the forward is pure tensor ops.
-    # KVARN_FUSED_VERIFY=0 reverts to single-token-only support.
+    # KVarN MTP verify currently appends draft K/V from current activations
+    # using per-step CPU offsets, so it must run eager. Single-token decode
+    # remains graph-capturable.
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_BATCH
-        if os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
-        else AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
@@ -317,8 +323,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # base helper.
         self._init_reorder_batch_threshold(
             1,
-            supports_spec_as_decode=(
-                os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"),
+            supports_spec_as_decode=False,
         )
         # KV-cache-group key, must match KVarNAttentionImpl._group_key for this
         # group's layers so the builder mutates the right group's slot allocator.
@@ -382,7 +387,10 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             self._group = KVarNConfig.from_cache_dtype(_cd, _hd).group
         except Exception:
             self._group = 128
-
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        self._has_speculative_config = speculative_config is not None
+        self._max_speculative_query_len = 1 + int(getattr(
+            speculative_config, "num_speculative_tokens", 0) or 0)
         # Persistent cu_seqlens buffers (allocated lazily in build()).
         self._cu_seqlens_q_buf: torch.Tensor | None = None
         self._cu_seqlens_k_buf: torch.Tensor | None = None
@@ -393,6 +401,10 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         self._vq_seqlen_buf: torch.Tensor | None = None
         self._vq_req_host: torch.Tensor | None = None
         self._vq_seqlen_host: torch.Tensor | None = None
+        self._store_slot_mapping_buf: torch.Tensor | None = None
+        self._store_slot_mapping_host: torch.Tensor | None = None
+        self._fa_build_seq_lens_buf: torch.Tensor | None = None
+        self._fa_build_seq_lens_host: torch.Tensor | None = None
         self._init_static_buffers(device)
 
     def _init_static_buffers(self, device: torch.device) -> None:
@@ -422,13 +434,50 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             token_cap, dtype=torch.int32, pin_memory=True)
         self._vq_seqlen_host = torch.empty(
             token_cap, dtype=torch.int32, pin_memory=True)
+        self._store_slot_mapping_buf = torch.empty(
+            token_cap, dtype=torch.long, device=device)
+        self._store_slot_mapping_host = torch.empty(
+            token_cap, dtype=torch.long, pin_memory=True)
+        self._fa_build_seq_lens_buf = torch.empty(
+            seq_cap - 1, dtype=torch.int32, device=device)
+        self._fa_build_seq_lens_host = torch.empty(
+            seq_cap - 1, dtype=torch.int32, pin_memory=True)
+
+    def _is_spec_decode_row(
+        self,
+        b: int,
+        seq_len: int,
+        query_len: int,
+        is_prefilling_cpu: list[bool] | None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None,
+    ) -> bool:
+        """True for MTP verify rows whose draft K/V must stay transient."""
+        if query_len <= 1 or seq_len <= query_len:
+            return False
+        if (is_prefilling_cpu is not None
+                and b < len(is_prefilling_cpu)
+                and is_prefilling_cpu[b]):
+            return False
+        if num_decode_draft_tokens_cpu is not None and b < len(num_decode_draft_tokens_cpu):
+            drafts = int(num_decode_draft_tokens_cpu[b])
+            return drafts > 0 and query_len == drafts + 1
+        return (self._has_speculative_config
+                and query_len <= self._max_speculative_query_len)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> KVarNMetadata:
         return self.build(0, common_attn_metadata)
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build=False,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+    ):
+        del num_accepted_tokens
         cam = common_attn_metadata
         assert self.reorder_batch_threshold is not None
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
@@ -444,14 +493,20 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # Used by flush detection to compute committed tokens so speculative
         # tokens that may still be rejected are never quantized permanently.
         _qsl = getattr(cam, "query_start_loc_cpu", None)
+        query_start_locs_cpu = None
         if _qsl is not None:
-            _qsl_l = _qsl.tolist()
+            query_start_locs_cpu = _qsl.tolist()
             query_lens_cpu = [
-                _qsl_l[i + 1] - _qsl_l[i]
-                for i in range(len(_qsl_l) - 1)
+                query_start_locs_cpu[i + 1] - query_start_locs_cpu[i]
+                for i in range(len(query_start_locs_cpu) - 1)
             ]
         else:
             query_lens_cpu = [1] * len(seq_lens_cpu)
+        is_prefilling_cpu = None
+        if cam.is_prefilling is not None:
+            is_prefilling_cpu = [
+                bool(x) for x in cam.is_prefilling.tolist()
+            ]
         # block_table as a numpy 2-D array (C-backed, lazy element access) rather
         # than .tolist(): the full B×max_blocks nested-list build was ~7 ms/step
         # at B=256 and dominated build() once the flush was vectorized (issue #15).
@@ -462,6 +517,18 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         bt_rows = block_table_np.shape[0]
         bt_cols = block_table_np.shape[1] if block_table_np.ndim == 2 else 0
         device = cam.seq_lens.device
+
+        store_slot_mapping_cpu = list(slot_mapping_cpu)
+        fa_build_seq_lens_cpu: list[int] = []
+        transient_query_kv_rows_cpu: list[bool] = []
+        for b, sl in enumerate(seq_lens_cpu):
+            q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+            is_spec_row = self._is_spec_decode_row(
+                b, sl, q_len, is_prefilling_cpu, num_decode_draft_tokens_cpu)
+            transient_query_kv_rows_cpu.append(is_spec_row)
+            committed = max(sl - q_len, 0)
+            fa_build_seq_lens_cpu.append(committed if is_spec_row else sl)
+        has_transient_query_kv = any(transient_query_kv_rows_cpu)
 
         # ── Stage α-2: capture-correct metadata ──────────────────────────
         # The decode driver uses ONE block_table-driven kernel that reads the
@@ -475,6 +542,33 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         cu_seqlens_k_h = [0]
         for sl in seq_lens_cpu:
             cu_seqlens_k_h.append(cu_seqlens_k_h[-1] + sl)
+
+        if (self._store_slot_mapping_buf is None
+                or self._store_slot_mapping_buf.shape[0] < len(store_slot_mapping_cpu)):
+            raise RuntimeError(
+                "KVarN static store slot-mapping buffer too small: "
+                f"need {len(store_slot_mapping_cpu)}, have "
+                f"{0 if self._store_slot_mapping_buf is None else self._store_slot_mapping_buf.shape[0]}. "
+                "Increase scheduler max_num_batched_tokens before startup.")
+        for i, slot in enumerate(store_slot_mapping_cpu):
+            self._store_slot_mapping_host[i] = slot
+        store_slot_mapping = self._store_slot_mapping_buf[:len(store_slot_mapping_cpu)]
+        store_slot_mapping.copy_(
+            self._store_slot_mapping_host[:len(store_slot_mapping_cpu)],
+            non_blocking=True)
+
+        if (self._fa_build_seq_lens_buf is None
+                or self._fa_build_seq_lens_buf.shape[0] < B):
+            raise RuntimeError(
+                "KVarN static build-lens buffer too small: "
+                f"need {B}, have "
+                f"{0 if self._fa_build_seq_lens_buf is None else self._fa_build_seq_lens_buf.shape[0]}. "
+                "Increase scheduler max_num_seqs before startup.")
+        for i, sl in enumerate(fa_build_seq_lens_cpu):
+            self._fa_build_seq_lens_host[i] = sl
+        fa_build_seq_lens = self._fa_build_seq_lens_buf[:B]
+        fa_build_seq_lens.copy_(
+            self._fa_build_seq_lens_host[:B], non_blocking=True)
 
         # ── Stage α-2: assign pool slots for every block_id touched this
         # step. The allocator state is class-level on KVarNAttentionImpl
@@ -510,16 +604,21 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             row = block_table_np[b]
             q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
             committed = max(sl - q_len, 0)
+            safe_query_len = 1 if transient_query_kv_rows_cpu[b] else q_len
+            safe_seq_len = committed + safe_query_len
+            if safe_seq_len <= committed:
+                continue
             # Blocks written this step. Record how full each will be AFTER the
             # step: if its owner finishes on the step that fills it, the
             # reclaim below must flush it (not discard).
             for k in range(committed // GROUP,
-                           min((sl - 1) // GROUP, bt_cols - 1) + 1):
+                           min((safe_seq_len - 1) // GROUP, bt_cols - 1) + 1):
                 bid = int(row[k])
                 if bid >= 0:
                     blocks_needed.add(bid)
-                    self._block_fill[bid] = min(sl, (k + 1) * GROUP) - k * GROUP
-        for s in slot_mapping_cpu:                 # safety superset of the above
+                    self._block_fill[bid] = (
+                        min(safe_seq_len, (k + 1) * GROUP) - k * GROUP)
+        for s in store_slot_mapping_cpu:           # safety superset of the above
             if s >= 0:
                 blocks_needed.add(s // GROUP)
 
@@ -821,14 +920,22 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             seq_lens_cpu=seq_lens_cpu,
             block_table_cpu=None,  # not consumed downstream; build() uses block_table_np
             slot_mapping_cpu=slot_mapping_cpu,
+            query_start_locs_cpu=query_start_locs_cpu,
+            query_lens_cpu=query_lens_cpu,
+            store_slot_mapping=store_slot_mapping,
+            store_slot_mapping_cpu=store_slot_mapping_cpu,
             fa_cu_seqlens_q=fa_cu_seqlens_q,
             fa_cu_seqlens_k=fa_cu_seqlens_k,
+            fa_cu_seqlens_k_cpu=cu_seqlens_k_h,
+            fa_build_seq_lens=fa_build_seq_lens,
             fa_total_k=int(cu_seqlens_k_h[B]) if B < len(cu_seqlens_k_h) else 0,
             fa_max_blocks_per_req=max_blocks_per_req,
             fa_max_seqlen_k_fixed=self._max_model_len,
             vq_req=vq_req_t,
             vq_seqlen=vq_seqlen_t,
             vq_qlen=vq_qlen,
+            has_transient_query_kv=has_transient_query_kv,
+            transient_query_kv_rows_cpu=transient_query_kv_rows_cpu,
         )
 
 
@@ -1433,10 +1540,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         )
         torch.cuda.synchronize(device)
 
-    def _batch_slot_mapping_cpu(self) -> list[int] | None:
-        """Return the slot_mapping CPU list cached on this step's metadata, or
-        None if unavailable. Looks up via the forward context so we don't need
-        the caller to plumb it through."""
+    def _current_kvarn_metadata(self) -> KVarNMetadata | None:
+        """Return this layer's KVarN metadata from the current forward context."""
         try:
             from vllm.forward_context import get_forward_context
             ctx = get_forward_context()
@@ -1445,19 +1550,25 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         md = getattr(ctx, "attn_metadata", None)
         if md is None:
             return None
+        layer_name = getattr(self, "layer_name", None)
         if isinstance(md, dict):
+            if layer_name is not None and isinstance(md.get(layer_name), KVarNMetadata):
+                return md[layer_name]
             for m in md.values():
                 if isinstance(m, KVarNMetadata):
-                    return m.slot_mapping_cpu
+                    return m
             return None
         if isinstance(md, list):
             for entry in md:
                 if isinstance(entry, dict):
+                    if (layer_name is not None
+                            and isinstance(entry.get(layer_name), KVarNMetadata)):
+                        return entry[layer_name]
                     for m in entry.values():
                         if isinstance(m, KVarNMetadata):
-                            return m.slot_mapping_cpu
+                            return m
             return None
-        return getattr(md, "slot_mapping_cpu", None)
+        return md if isinstance(md, KVarNMetadata) else None
 
     def _hadamard(self, device: torch.device) -> torch.Tensor:
         return _build_hadamard(self.head_size, device)
@@ -1753,6 +1864,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # Ensure pool + lookup tensors + rotation scratch exist (no-op during
         # capture; first call before capture sizes pool to kv_cache num_blocks).
         self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
+        md = self._current_kvarn_metadata()
+        store_slot_mapping = slot_mapping[:N]
+        if (md is not None and md.store_slot_mapping is not None
+                and md.store_slot_mapping.shape[0] >= N):
+            store_slot_mapping = md.store_slot_mapping[:N]
 
         # Reshape to (N, Hk, D) — view, no copy (key/value already fp16).
         k_view = key[:N].view(N, Hk, D)
@@ -1772,7 +1888,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             _kvarn_scatter_store_kernel,
         )
         _kvarn_scatter_store_kernel[(N, Hk)](
-            k_rot, v_rot, slot_mapping[:N],
+            k_rot, v_rot, store_slot_mapping,
             self._block_to_slot_t,
             self._tail_K_pool, self._tail_V_pool,
             k_rot.stride(0), k_rot.stride(1),
@@ -1845,13 +1961,22 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             # Pure multi-token decode batch = a spec-decode verify step
             # (uniform query length under graph capture). One fused-kernel
             # pass over the vq plan — fully graph-capturable.
-            attn_out = self._verify_decode_path(q, kv_cache, attn_metadata)
+            if attn_metadata.has_transient_query_kv:
+                k = key[:N].view(N, self.num_kv_heads, self.head_size)
+                v = value[:N].view(N, self.num_kv_heads, self.head_size)
+                attn_out = self._cached_multiquery_path(
+                    q, kv_cache, attn_metadata, k_current=k, v_current=v)
+            else:
+                attn_out = self._verify_decode_path(q, kv_cache, attn_metadata)
         elif attn_metadata.num_decodes == 0:
             if attn_metadata.has_cached_multiquery:
                 # Speculative-decode verify (or chunked-prefill continuation):
                 # the query tokens have cached history that must be attended.
                 # _prefill_first_chunk would drop it; use the context-aware path.
-                attn_out = self._cached_multiquery_path(q, kv_cache, attn_metadata)
+                k = key[:N].view(N, self.num_kv_heads, self.head_size)
+                v = value[:N].view(N, self.num_kv_heads, self.head_size)
+                attn_out = self._cached_multiquery_path(
+                    q, kv_cache, attn_metadata, k_current=k, v_current=v)
             else:
                 k = key[:N].view(N, self.num_kv_heads, self.head_size)
                 v = value[:N].view(N, self.num_kv_heads, self.head_size)
@@ -2061,6 +2186,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     def _cached_multiquery_path(
         self, q: torch.Tensor, kv_cache: torch.Tensor,
         attn_metadata: KVarNMetadata,
+        k_current: torch.Tensor | None = None,
+        v_current: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multi-query tokens with cached history (a speculative-decode verify
         step or a chunked-prefill continuation), batched (issue #10).
@@ -2093,7 +2220,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # continuations), where one materialization amortizes over thousands
         # of query tokens. KVARN_FUSED_VERIFY=0 forces materialize always.
         _group = self.kvarn_config.group
-        if (os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
+        if (not md.has_transient_query_kv
+                and os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
                 and md.max_query_len
                 <= int(os.environ.get("KVARN_FUSED_VERIFY_MAXQ", "8"))
                 and (int(md.max_seq_len) + _group - 1) // _group
@@ -2107,6 +2235,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         backend = self._validate_materialized_attn_backend()
 
         seq_lens = md.seq_lens[:B].to(torch.int32)
+        build_seq_lens = (
+            md.fa_build_seq_lens[:B]
+            if md.fa_build_seq_lens is not None else seq_lens)
         cu_k = md.fa_cu_seqlens_k
         if cu_k is None:
             raise RuntimeError(
@@ -2141,7 +2272,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         K_packed = self._fa_K_buf
         V_packed = self._fa_V_buf
         _kvarn_build_packed_kv_kernel[(B * max_blocks, Hk)](
-            md.block_table, seq_lens, cu_k,
+            md.block_table, build_seq_lens, cu_k,
             self._block_to_slot_t,
             kv_cache, self._tail_K_pool, self._tail_V_pool,
             K_packed, V_packed,
@@ -2167,6 +2298,38 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         H16 = (self._H_fp16 if self._H_fp16 is not None
                else self._hadamard(q.device).to(torch.float16))
         n_tok = q.shape[0]
+        if md.has_transient_query_kv:
+            if k_current is None or v_current is None:
+                raise RuntimeError(
+                    "KVarN transient query K/V requested without current K/V.")
+            if (md.query_start_locs_cpu is None or md.query_lens_cpu is None
+                    or md.seq_lens_cpu is None
+                    or md.transient_query_kv_rows_cpu is None):
+                raise RuntimeError(
+                    "KVarN transient query K/V metadata is incomplete.")
+            if self._k_rot_scratch is None or self._v_rot_scratch is None:
+                raise RuntimeError(
+                    "KVarN rotation scratch was not initialized.")
+            k_rot_cur = self._k_rot_scratch[:n_tok]
+            v_rot_cur = self._v_rot_scratch[:n_tok]
+            torch.matmul(k_current[:n_tok].to(torch.float16), H16, out=k_rot_cur)
+            torch.matmul(v_current[:n_tok].to(torch.float16), H16, out=v_rot_cur)
+            if md.fa_cu_seqlens_k_cpu is None:
+                raise RuntimeError(
+                    "KVarN transient query K/V metadata is missing CPU K offsets.")
+            cu_k_cpu = md.fa_cu_seqlens_k_cpu
+            for b in range(B):
+                if not md.transient_query_kv_rows_cpu[b]:
+                    continue
+                q_start = md.query_start_locs_cpu[b]
+                q_len = md.query_lens_cpu[b]
+                committed = max(md.seq_lens_cpu[b] - q_len, 0)
+                dst = cu_k_cpu[b] + committed
+                K_packed[dst:dst + q_len].copy_(
+                    k_rot_cur[q_start:q_start + q_len])
+                V_packed[dst:dst + q_len].copy_(
+                    v_rot_cur[q_start:q_start + q_len])
+
         flat_rows = n_tok * self.num_heads
         if (self._materialized_q_rot_buf is None
                 or self._materialized_out_buf is None
@@ -2235,6 +2398,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             if attn_metadata.fa_cu_seqlens_q is not None
             else None
         )
+        dec_transient_rows = (
+            attn_metadata.transient_query_kv_rows_cpu[:num_decodes]
+            if attn_metadata.transient_query_kv_rows_cpu is not None else None)
         mbpr = (self._max_model_len + group - 1) // group
         decode_meta = KVarNMetadata(
             seq_lens=attn_metadata.seq_lens[:num_decodes],
@@ -2246,8 +2412,25 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             is_prefill=False,
             fa_cu_seqlens_q=dec_cu_q,
             fa_cu_seqlens_k=dec_cu_k,
+            fa_cu_seqlens_k_cpu=(
+                attn_metadata.fa_cu_seqlens_k_cpu[:num_decodes + 1]
+                if attn_metadata.fa_cu_seqlens_k_cpu is not None else None),
+            fa_build_seq_lens=(
+                attn_metadata.fa_build_seq_lens[:num_decodes]
+                if attn_metadata.fa_build_seq_lens is not None else None),
             fa_max_blocks_per_req=mbpr,
             fa_max_seqlen_k_fixed=self._max_model_len,
+            seq_lens_cpu=(
+                attn_metadata.seq_lens_cpu[:num_decodes]
+                if attn_metadata.seq_lens_cpu is not None else None),
+            query_start_locs_cpu=(
+                attn_metadata.query_start_locs_cpu[:num_decodes + 1]
+                if attn_metadata.query_start_locs_cpu is not None else None),
+            query_lens_cpu=(
+                attn_metadata.query_lens_cpu[:num_decodes]
+                if attn_metadata.query_lens_cpu is not None else None),
+            has_transient_query_kv=bool(dec_transient_rows and any(dec_transient_rows)),
+            transient_query_kv_rows_cpu=dec_transient_rows,
         )
         if attn_metadata.vq_seqlen is not None:
             # Spec-as-decode: the decode portion carries multi-token verify
@@ -2255,9 +2438,18 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             decode_meta.vq_req = attn_metadata.vq_req[:num_decode_tokens]
             decode_meta.vq_seqlen = attn_metadata.vq_seqlen[:num_decode_tokens]
             decode_meta.vq_qlen = attn_metadata.vq_qlen
-            out[:num_decode_tokens] = self._verify_decode_path(
-                q[:num_decode_tokens], kv_cache, decode_meta,
-            )
+            if decode_meta.has_transient_query_kv:
+                k_dec = k_all[:num_decode_tokens].view(
+                    -1, self.num_kv_heads, self.head_size)
+                v_dec = v_all[:num_decode_tokens].view(
+                    -1, self.num_kv_heads, self.head_size)
+                out[:num_decode_tokens] = self._cached_multiquery_path(
+                    q[:num_decode_tokens], kv_cache, decode_meta,
+                    k_current=k_dec, v_current=v_dec)
+            else:
+                out[:num_decode_tokens] = self._verify_decode_path(
+                    q[:num_decode_tokens], kv_cache, decode_meta,
+                )
         else:
             out[:num_decode_tokens] = self._decode_path(
                 q[:num_decode_tokens], kv_cache, decode_meta,
@@ -2275,6 +2467,15 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             if attn_metadata.seq_lens_cpu is not None
             else None
         )
+        prefill_qsl_cpu = None
+        if attn_metadata.query_start_locs_cpu is not None:
+            prefill_qsl_cpu = [
+                x - num_decode_tokens
+                for x in attn_metadata.query_start_locs_cpu[num_decodes:]
+            ]
+        prefill_transient_rows = (
+            attn_metadata.transient_query_kv_rows_cpu[num_decodes:]
+            if attn_metadata.transient_query_kv_rows_cpu is not None else None)
         prefill_meta = KVarNMetadata(
             seq_lens=prefill_seq_lens,
             slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
@@ -2285,16 +2486,33 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             max_seq_len=attn_metadata.max_seq_len,  # WSL fix (PR #16): avoid per-step .item() D2H sync (global max is a safe upper bound for the prefill kernel)
             is_prefill=True,
             seq_lens_cpu=prefill_seq_lens_cpu,
+            query_start_locs_cpu=prefill_qsl_cpu,
+            query_lens_cpu=(
+                attn_metadata.query_lens_cpu[num_decodes:]
+                if attn_metadata.query_lens_cpu is not None else None),
             fa_cu_seqlens_k=prefill_cu_k,
+            fa_cu_seqlens_k_cpu=(
+                attn_metadata.fa_cu_seqlens_k_cpu[num_decodes:]
+                if attn_metadata.fa_cu_seqlens_k_cpu is not None else None),
+            fa_build_seq_lens=(
+                attn_metadata.fa_build_seq_lens[num_decodes:]
+                if attn_metadata.fa_build_seq_lens is not None else None),
             fa_total_k=attn_metadata.fa_total_k,
+            has_transient_query_kv=bool(
+                prefill_transient_rows and any(prefill_transient_rows)),
+            transient_query_kv_rows_cpu=prefill_transient_rows,
         )
         if attn_metadata.has_cached_multiquery:
             # The multi-query (prefill-classified) requests here are speculative
             # -decode verify steps / chunked-prefill continuations with cached
             # history — attend over the cached K/V, not just the new tokens.
+            k_pref = k_all[num_decode_tokens:].view(
+                -1, self.num_kv_heads, self.head_size)
+            v_pref = v_all[num_decode_tokens:].view(
+                -1, self.num_kv_heads, self.head_size)
             out[num_decode_tokens:] = self._cached_multiquery_path(
                 q[num_decode_tokens:], kv_cache, prefill_meta,
-            )
+                k_current=k_pref, v_current=v_pref)
         else:
             k_pref = k_all[num_decode_tokens:].view(-1, self.num_kv_heads, self.head_size)
             v_pref = v_all[num_decode_tokens:].view(-1, self.num_kv_heads, self.head_size)
