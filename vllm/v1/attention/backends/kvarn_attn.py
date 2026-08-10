@@ -530,6 +530,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         bt_cols = block_table_np.shape[1] if block_table_np.ndim == 2 else 0
         device = cam.seq_lens.device
 
+        GROUP = self._group  # KVarN tile size (= block size); 64 or 128
         store_slot_mapping_cpu = list(slot_mapping_cpu)
         draft_store_indices_cpu = [-1] * len(slot_mapping_cpu)
         accepted_tokens_cpu = [1] * len(seq_lens_cpu)
@@ -593,7 +594,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # cu_seqlens_q (= arange(B+1)), both kept in PERSISTENT buffers and
         # updated in place so captured graphs see fresh values.
         B = len(seq_lens_cpu)
-        GROUP = self._group                            # KVarN tile size (= block size); 64 or 128
         cu_seqlens_k_h = [0]
         for sl in seq_lens_cpu:
             cu_seqlens_k_h.append(cu_seqlens_k_h[-1] + sl)
