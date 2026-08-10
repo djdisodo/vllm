@@ -260,6 +260,41 @@ def _kvarn_scatter_store_kernel(
     tl.store(Pool_V_ptr + dst_offs, v_row)
 
 
+@triton.jit
+def _kvarn_scatter_draft_store_kernel(
+    K_in_ptr,             # [N, Hk, D] fp16 (already rotated)
+    V_in_ptr,             # [N, Hk, D] fp16
+    Draft_index_ptr,      # [N] int32 (-1 => not a draft token)
+    Draft_K_ptr,          # [DRAFT_SLOTS, Hk, D] fp16
+    Draft_V_ptr,          # [DRAFT_SLOTS, Hk, D] fp16
+    stride_in_n, stride_in_h,
+    stride_draft_s, stride_draft_h,
+    D: tl.constexpr,
+):
+    """Scatter one rotated draft K/V token into MTP scratch.
+
+    The metadata builder owns scratch index allocation and later promotes only
+    accepted indices into the durable tail pool. This kernel deliberately has
+    no block-table or tail-pool side effects.
+    """
+    i = tl.program_id(0)
+    hk = tl.program_id(1)
+
+    scratch_idx = tl.load(Draft_index_ptr + i)
+    if scratch_idx < 0:
+        return
+
+    d = tl.arange(0, D)
+    src_offs = i * stride_in_n + hk * stride_in_h + d
+    dst_offs = (
+        scratch_idx.to(tl.int64) * stride_draft_s
+        + hk * stride_draft_h
+        + d
+    )
+    tl.store(Draft_K_ptr + dst_offs, tl.load(K_in_ptr + src_offs))
+    tl.store(Draft_V_ptr + dst_offs, tl.load(V_in_ptr + src_offs))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage α-2 capture-correct: ONE block_table-driven build-packed-KV kernel.
 # Reads vLLM's persistent block_table + seq_lens directly (so a captured CUDA

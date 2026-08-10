@@ -275,12 +275,18 @@ class KVarNMetadata(AttentionMetadata):
     slot_mapping_cpu: list[int] | None = None
     query_start_locs_cpu: list[int] | None = None
     query_lens_cpu: list[int] | None = None
-    # Slot mapping used by KVarN's fp16 pool store. During MTP verify, draft
-    # tokens are staged in the pool so accepted drafts remain available next
-    # step, but durable fill/flush accounting below only advances through
-    # committed tokens.
+    # Slot mapping used by KVarN's fp16 pool store. During MTP verify, only
+    # the real decode token is durable; draft tokens are masked out here and
+    # stored in the separate MTP draft scratch below.
     store_slot_mapping: torch.Tensor | None = None
     store_slot_mapping_cpu: list[int] | None = None
+    # Per-token scratch index for MTP draft K/V. -1 means "not a draft token".
+    # The metadata builder allocates these indices from a per-cache-group
+    # scratch allocator, keyed by physical slot_mapping so the next step can
+    # promote accepted draft tokens into the durable tail pool after row
+    # reordering.
+    draft_store_indices: torch.Tensor | None = None
+    draft_store_indices_cpu: list[int] | None = None
     # K/V lengths to materialize from persistent cache before appending current
     # raw query K/V. Equals seq_lens except for speculative rows, where it is
     # the committed prefix length (seq_len - query_len).
@@ -308,9 +314,10 @@ class KVarNMetadata(AttentionMetadata):
 class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     """Builds ``KVarNMetadata`` from scheduler output."""
 
-    # KVarN MTP verify currently appends draft K/V from current activations
-    # using per-step CPU offsets, so it must run eager. Single-token decode
-    # remains graph-capturable.
+    # KVarN MTP verify keeps draft K/V in a separate scratch pool and promotes
+    # only accepted tokens on the next step. The materialized verify path still
+    # appends current query K/V from activations using per-step CPU offsets, so
+    # it must run eager. Single-token decode remains graph-capturable.
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
@@ -403,6 +410,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         self._vq_seqlen_host: torch.Tensor | None = None
         self._store_slot_mapping_buf: torch.Tensor | None = None
         self._store_slot_mapping_host: torch.Tensor | None = None
+        self._draft_store_indices_buf: torch.Tensor | None = None
+        self._draft_store_indices_host: torch.Tensor | None = None
         self._fa_build_seq_lens_buf: torch.Tensor | None = None
         self._fa_build_seq_lens_host: torch.Tensor | None = None
         self._init_static_buffers(device)
@@ -438,6 +447,10 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             token_cap, dtype=torch.long, device=device)
         self._store_slot_mapping_host = torch.empty(
             token_cap, dtype=torch.long, pin_memory=True)
+        self._draft_store_indices_buf = torch.empty(
+            token_cap, dtype=torch.int32, device=device)
+        self._draft_store_indices_host = torch.empty(
+            token_cap, dtype=torch.int32, pin_memory=True)
         self._fa_build_seq_lens_buf = torch.empty(
             seq_cap - 1, dtype=torch.int32, device=device)
         self._fa_build_seq_lens_host = torch.empty(
@@ -477,7 +490,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
     ):
-        del num_accepted_tokens
         cam = common_attn_metadata
         assert self.reorder_batch_threshold is not None
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
@@ -519,8 +531,17 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         device = cam.seq_lens.device
 
         store_slot_mapping_cpu = list(slot_mapping_cpu)
+        draft_store_indices_cpu = [-1] * len(slot_mapping_cpu)
+        accepted_tokens_cpu = [1] * len(seq_lens_cpu)
+        if num_accepted_tokens is not None:
+            accepted_tokens_cpu = [
+                int(x) for x in num_accepted_tokens[:len(seq_lens_cpu)]
+                .detach().cpu().tolist()
+            ]
         fa_build_seq_lens_cpu: list[int] = []
         transient_query_kv_rows_cpu: list[bool] = []
+        current_draft_slot_mappings: list[tuple[int, int]] = []
+        promote_slot_mappings: list[int] = []
         for b, sl in enumerate(seq_lens_cpu):
             q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
             is_spec_row = self._is_spec_decode_row(
@@ -528,6 +549,40 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             transient_query_kv_rows_cpu.append(is_spec_row)
             committed = max(sl - q_len, 0)
             fa_build_seq_lens_cpu.append(committed if is_spec_row else sl)
+            q_start = (
+                query_start_locs_cpu[b]
+                if query_start_locs_cpu is not None and b < len(query_start_locs_cpu)
+                else b
+            )
+            if is_spec_row:
+                # Only the first token in an MTP verify row is unconditionally
+                # committed. Draft tokens are written to the per-group scratch
+                # pool and promoted on the next step once vLLM reports how many
+                # draft tokens were accepted.
+                for j in range(1, q_len):
+                    idx = q_start + j
+                    if idx < len(store_slot_mapping_cpu):
+                        sm = store_slot_mapping_cpu[idx]
+                        store_slot_mapping_cpu[idx] = -1
+                        if sm >= 0:
+                            current_draft_slot_mappings.append((idx, sm))
+
+            accepted = (
+                accepted_tokens_cpu[b] if b < len(accepted_tokens_cpu) else 1)
+            if accepted > 1 and b < bt_rows and bt_cols > 0:
+                # accepted includes the real token at offset 0. The accepted
+                # draft positions are the tail of the already-computed prefix
+                # immediately before this step's query tokens.
+                first_pos = max(committed - accepted + 1, 0)
+                last_pos = max(committed - 1, -1)
+                row = block_table_np[b]
+                for pos in range(first_pos, last_pos + 1):
+                    k = pos // GROUP
+                    if k >= bt_cols:
+                        break
+                    bid = int(row[k])
+                    if bid >= 0:
+                        promote_slot_mappings.append(bid * GROUP + (pos % GROUP))
         has_transient_query_kv = any(transient_query_kv_rows_cpu)
 
         # ── Stage α-2: capture-correct metadata ──────────────────────────
@@ -542,20 +597,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         cu_seqlens_k_h = [0]
         for sl in seq_lens_cpu:
             cu_seqlens_k_h.append(cu_seqlens_k_h[-1] + sl)
-
-        if (self._store_slot_mapping_buf is None
-                or self._store_slot_mapping_buf.shape[0] < len(store_slot_mapping_cpu)):
-            raise RuntimeError(
-                "KVarN static store slot-mapping buffer too small: "
-                f"need {len(store_slot_mapping_cpu)}, have "
-                f"{0 if self._store_slot_mapping_buf is None else self._store_slot_mapping_buf.shape[0]}. "
-                "Increase scheduler max_num_batched_tokens before startup.")
-        for i, slot in enumerate(store_slot_mapping_cpu):
-            self._store_slot_mapping_host[i] = slot
-        store_slot_mapping = self._store_slot_mapping_buf[:len(store_slot_mapping_cpu)]
-        store_slot_mapping.copy_(
-            self._store_slot_mapping_host[:len(store_slot_mapping_cpu)],
-            non_blocking=True)
 
         if (self._fa_build_seq_lens_buf is None
                 or self._fa_build_seq_lens_buf.shape[0] < B):
@@ -618,7 +659,10 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     blocks_needed.add(bid)
                     self._block_fill[bid] = (
                         min(safe_seq_len, (k + 1) * GROUP) - k * GROUP)
-        for s in store_slot_mapping_cpu:           # safety superset of the above
+        for s in store_slot_mapping_cpu:
+            if s >= 0:
+                blocks_needed.add(s // GROUP)
+        for s in promote_slot_mappings:
             if s >= 0:
                 blocks_needed.add(s // GROUP)
 
@@ -631,10 +675,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         for i in group_impls:
             i._group_key = gk
         if group_impls:
-            impl0 = group_impls[0]
             # Ensure pool + lookup tensors exist for this device.
-            impl0._ensure_pool(device,
-                num_blocks_hint=max(blocks_needed, default=0) + 1)
+            num_blocks_hint = max(blocks_needed, default=0) + 1
+            for impl in group_impls:
+                impl._ensure_pool(device, num_blocks_hint=num_blocks_hint)
+            impl0 = group_impls[0]
             mkey = (device, gk)
             b2s_t = KVarNAttentionImpl._block_to_slot_t_per_device[mkey]
             is_sink_t = KVarNAttentionImpl._is_sink_t_per_device[mkey]
@@ -700,13 +745,12 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             #
             # Why not the full `sl` (or the previous step's `sl`): under
             # speculative decoding (MTP / draft) a step appends `num_spec+1`
-            # tokens at once and seq_len jumps by a VARIABLE accepted amount,
-            # with later-rejected speculative tokens sitting in the pool until
-            # they are overwritten next step. Quantizing a block to int4 is
-            # PERMANENT, so flushing a block that still contains a speculative
-            # (rejectable) token freezes wrong KV → progressive corruption →
-            # repetition-collapse / garbage. Using the committed length means we
-            # only ever quantize blocks whose tokens are all accepted.
+            # tokens at once and seq_len jumps by a VARIABLE accepted amount.
+            # Current draft K/V lives in MTP scratch, not the tail pool; accepted
+            # drafts are promoted at the start of a later step. Quantizing a
+            # block to int4 is PERMANENT, so flushing is still based on the
+            # committed boundary, after promotion, and never on optimistic
+            # speculative length.
             #
             # Walk each row BACKWARD from the committed boundary while blocks
             # still hold pool slots — those are exactly the full-but-unflushed
@@ -835,6 +879,82 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                         KVarNAttentionImpl._max_known_block_id.get(gk, 0), bid
                     )
 
+            # (4) Promote accepted MTP draft tokens from last step's scratch
+            # into the durable fp16 tail pool. `num_accepted_tokens` belongs to
+            # the previous speculative step; using the current block table and
+            # committed length above gives the physical slots of the accepted
+            # draft suffix even if vLLM reordered rows between steps.
+            draft_map = KVarNAttentionImpl._draft_slot_to_index[gk]
+            draft_free = KVarNAttentionImpl._draft_free_indices[gk]
+            for sm in promote_slot_mappings:
+                scratch_idx = draft_map.get(sm)
+                if scratch_idx is None:
+                    continue
+                bid = sm // GROUP
+                pos = sm % GROUP
+                pool_slot = dict_map.get(bid)
+                if pool_slot is None:
+                    continue
+                for impl in group_impls:
+                    if (impl._draft_K_scratch is None
+                            or impl._draft_V_scratch is None
+                            or impl._tail_K_pool is None
+                            or impl._tail_V_pool is None):
+                        continue
+                    impl._tail_K_pool[pool_slot, pos].copy_(
+                        impl._draft_K_scratch[scratch_idx])
+                    impl._tail_V_pool[pool_slot, pos].copy_(
+                        impl._draft_V_scratch[scratch_idx])
+                self._block_fill[bid] = max(self._block_fill.get(bid, 0), pos + 1)
+
+            # Free every previous-step scratch row now. Rows not promoted are
+            # rejected draft tokens or state for requests that left the batch.
+            for _, idx in list(draft_map.items()):
+                draft_free.append(idx)
+            draft_map.clear()
+
+            # (5) Allocate scratch rows for this step's current draft tokens.
+            for token_idx, sm in current_draft_slot_mappings:
+                if sm in draft_map:
+                    scratch_idx = draft_map[sm]
+                else:
+                    if not draft_free:
+                        raise RuntimeError(
+                            "KVarN MTP draft scratch exhausted "
+                            f"({KVarNAttentionImpl._draft_scratch_size.get(gk)} slots). "
+                            "Increase KVARN_DRAFT_SCRATCH_SLOTS.")
+                    scratch_idx = draft_free.pop()
+                    draft_map[sm] = scratch_idx
+                if token_idx < len(draft_store_indices_cpu):
+                    draft_store_indices_cpu[token_idx] = scratch_idx
+
+        if (self._store_slot_mapping_buf is None
+                or self._store_slot_mapping_buf.shape[0] < len(store_slot_mapping_cpu)):
+            raise RuntimeError(
+                "KVarN static store slot-mapping buffer too small: "
+                f"need {len(store_slot_mapping_cpu)}, have "
+                f"{0 if self._store_slot_mapping_buf is None else self._store_slot_mapping_buf.shape[0]}. "
+                "Increase scheduler max_num_batched_tokens before startup.")
+        if (self._draft_store_indices_buf is None
+                or self._draft_store_indices_buf.shape[0] < len(draft_store_indices_cpu)):
+            raise RuntimeError(
+                "KVarN static draft-store index buffer too small: "
+                f"need {len(draft_store_indices_cpu)}, have "
+                f"{0 if self._draft_store_indices_buf is None else self._draft_store_indices_buf.shape[0]}. "
+                "Increase scheduler max_num_batched_tokens before startup.")
+        for i, slot in enumerate(store_slot_mapping_cpu):
+            self._store_slot_mapping_host[i] = slot
+        for i, scratch_idx in enumerate(draft_store_indices_cpu):
+            self._draft_store_indices_host[i] = scratch_idx
+        store_slot_mapping = self._store_slot_mapping_buf[:len(store_slot_mapping_cpu)]
+        draft_store_indices = self._draft_store_indices_buf[:len(draft_store_indices_cpu)]
+        store_slot_mapping.copy_(
+            self._store_slot_mapping_host[:len(store_slot_mapping_cpu)],
+            non_blocking=True)
+        draft_store_indices.copy_(
+            self._draft_store_indices_host[:len(draft_store_indices_cpu)],
+            non_blocking=True)
+
         # ── Persistent cu_seqlens buffers (in-place updated) ─────────────
         # A captured graph bakes in tensor addresses, so cu_seqlens MUST live
         # in fixed buffers updated in place — not recreated each step.
@@ -924,6 +1044,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             query_lens_cpu=query_lens_cpu,
             store_slot_mapping=store_slot_mapping,
             store_slot_mapping_cpu=store_slot_mapping_cpu,
+            draft_store_indices=draft_store_indices,
+            draft_store_indices_cpu=draft_store_indices_cpu,
             fa_cu_seqlens_q=fa_cu_seqlens_q,
             fa_cu_seqlens_k=fa_cu_seqlens_k,
             fa_cu_seqlens_k_cpu=cu_seqlens_k_h,
@@ -1008,6 +1130,13 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _block_to_slot_t_per_device: ClassVar[dict[tuple, torch.Tensor]] = {}
     _is_sink_t_per_device: ClassVar[dict[tuple, torch.Tensor]] = {}
     _max_known_block_id: ClassVar[dict[tuple, int]] = {}
+    # MTP draft scratch allocator, scoped per KV-cache group. Keys are physical
+    # token slot_mappings (block_id * group + pos). Values are compact scratch
+    # indices shared by every layer in the group; each layer owns its actual
+    # K/V scratch tensors and the builder promotes accepted slots by index.
+    _draft_slot_to_index: ClassVar[dict[tuple, dict[int, int]]] = {}
+    _draft_free_indices: ClassVar[dict[tuple, list[int]]] = {}
+    _draft_scratch_size: ClassVar[dict[tuple, int]] = {}
     # Keys (device, D, group, k_bits, v_bits) whose flush kernels (Sinkhorn +
     # int4 store) have already been JIT-compiled via the pool-init warmup.
     _kernel_warmed: ClassVar[set] = set()
@@ -1086,6 +1215,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # builder, between captured graph replays).
         self._tail_K_pool: torch.Tensor | None = None   # [POOL_SIZE, group, Hk, D] fp16
         self._tail_V_pool: torch.Tensor | None = None
+        self._draft_K_scratch: torch.Tensor | None = None  # [DRAFT_SLOTS, Hk, D] fp16
+        self._draft_V_scratch: torch.Tensor | None = None
         # Per-instance shorthand views of the class-level per-device tensors
         # (so kernels can read without dict lookups). Re-bound on every
         # _ensure_pool call.
@@ -1228,6 +1359,21 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cls._allocator_pool_size[gk] = pool_size
             cls._block_to_slot_dict[gk] = {}
             cls._global_sink_blocks[gk] = set()
+        if gk not in cls._draft_free_indices:
+            max_spec_tokens = max(int(os.environ.get("KVARN_MTP_MAX_DRAFTS", "8")), 1)
+            draft_slots = int(os.environ.get("KVARN_DRAFT_SCRATCH_SLOTS", "0"))
+            if draft_slots <= 0:
+                draft_slots = max(self._max_num_seqs * max_spec_tokens + 32, 64)
+            cls._draft_free_indices[gk] = list(range(draft_slots - 1, -1, -1))
+            cls._draft_slot_to_index[gk] = {}
+            cls._draft_scratch_size[gk] = draft_slots
+
+        draft_slots = cls._draft_scratch_size[gk]
+        if self._draft_K_scratch is None:
+            self._draft_K_scratch = torch.empty(
+                draft_slots, self.num_kv_heads, cfg.head_dim,
+                dtype=torch.float16, device=device)
+            self._draft_V_scratch = torch.empty_like(self._draft_K_scratch)
 
         # GPU lookup tensors, keyed by (device, group_key): each KV-cache group
         # has its own block_id space, so the two groups must NOT share a mirror.
@@ -1885,6 +2031,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # pool slot) is done inside the kernel against the GPU
         # _block_to_slot_t tensor (mutated only by the metadata builder).
         from vllm.v1.attention.ops.triton_kvarn_decode import (
+            _kvarn_scatter_draft_store_kernel,
             _kvarn_scatter_store_kernel,
         )
         _kvarn_scatter_store_kernel[(N, Hk)](
@@ -1899,6 +2046,20 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             NUM_BLOCKS_LOOKUP=self._block_lookup_size,
             num_warps=2, num_stages=2,
         )
+        if (md is not None and md.has_transient_query_kv
+                and md.draft_store_indices is not None
+                and md.draft_store_indices.shape[0] >= N):
+            if self._draft_K_scratch is None or self._draft_V_scratch is None:
+                raise RuntimeError("KVarN draft scratch was not initialized.")
+            _kvarn_scatter_draft_store_kernel[(N, Hk)](
+                k_rot, v_rot, md.draft_store_indices[:N],
+                self._draft_K_scratch, self._draft_V_scratch,
+                k_rot.stride(0), k_rot.stride(1),
+                self._draft_K_scratch.stride(0),
+                self._draft_K_scratch.stride(1),
+                D=D,
+                num_warps=2, num_stages=2,
+            )
         # No CPU bookkeeping here — fill tracking + flush triggering live in
         # KVarNMetadataBuilder.build() (outside the captured region). This
         # method is now pure tensor ops, safe inside a captured CUDA graph.
