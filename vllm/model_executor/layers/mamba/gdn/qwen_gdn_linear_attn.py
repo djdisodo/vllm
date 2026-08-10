@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import os
 from typing import Literal
 
 import torch
@@ -1016,6 +1017,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self._prefill_kernels_warmed_up:
             return
         self._prefill_kernels_warmed_up = True
+        if os.environ.get("GDN_SKIP_PREFILL_WARMUP", "0") == "1":
+            logger.warning_once(
+                "Skipping GDN prefill kernel warmup. First prefill may spend "
+                "time in Triton autotune and may need extra temporary memory.")
+            return
 
         device = qkv_or_qkvz.device
         dtype = qkv_or_qkvz.dtype
