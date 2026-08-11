@@ -437,6 +437,89 @@ def _kvarn_build_packed_kv_kernel(
         tl.store(V_out_ptr + out_addrs, V_rot.to(tl.float16), mask=g_mask[:, None])
 
 
+@triton.jit
+def _kvarn_dequant_cache_blocks_to_pool_kernel(
+    KV_cache_ptr,       # [num_blocks, num_kv_heads, TILE_BYTES] uint8
+    Block_ids_ptr,      # [N] int64/int32
+    Slots_ptr,          # [N] int64/int32
+    Tail_K_pool_ptr,    # [POOL_SIZE, group, Hk, D] fp16
+    Tail_V_pool_ptr,    # [POOL_SIZE, group, Hk, D] fp16
+    # strides
+    stride_kv_b, stride_kv_h,
+    stride_pool_b, stride_pool_t, stride_pool_h,
+    # constexprs
+    D: tl.constexpr,
+    GROUP: tl.constexpr,
+    K_BITS: tl.constexpr,
+    V_BITS: tl.constexpr,
+    K_PACKED_OFFSET: tl.constexpr,
+    K_S_COL_OFFSET: tl.constexpr,
+    K_ZP_OFFSET: tl.constexpr,
+    K_S_ROW_OFFSET: tl.constexpr,
+    V_PACKED_OFFSET: tl.constexpr,
+    V_S_COL_OFFSET: tl.constexpr,
+    V_S_ROW_OFFSET: tl.constexpr,
+    V_ZP_OFFSET: tl.constexpr,
+):
+    """Seed KVarN's fp16 tail pool from a compressed cache block.
+
+    vLLM CoW block copies operate on the backing KV-cache bytes. If the copied
+    destination block later receives more tokens, KVarN must allocate a pool slot
+    for it, and that slot has to contain the copied prefix before suffix writes.
+    """
+    i = tl.program_id(0)
+    hk = tl.program_id(1)
+
+    block_id = tl.load(Block_ids_ptr + i).to(tl.int64)
+    slot = tl.load(Slots_ptr + i).to(tl.int64)
+    if slot < 0:
+        return
+
+    d_offs = tl.arange(0, D)
+    g_offs = tl.arange(0, GROUP)
+    PACK_K: tl.constexpr = 8 // K_BITS
+    PACK_V: tl.constexpr = 8 // V_BITS
+    MASK_K: tl.constexpr = (1 << K_BITS) - 1
+    MASK_V: tl.constexpr = (1 << V_BITS) - 1
+    tile_base = block_id * stride_kv_b + hk * stride_kv_h
+    g_byte_k = g_offs // PACK_K
+    g_shift_k = (g_offs % PACK_K) * K_BITS
+    d_byte_v = d_offs // PACK_V
+    d_shift_v = (d_offs % PACK_V) * V_BITS
+
+    ku16 = (KV_cache_ptr + tile_base).to(tl.pointer_type(tl.uint16))
+    s_col_K = tl.load(ku16 + (K_S_COL_OFFSET // 2) + d_offs).to(
+        tl.float16, bitcast=True).to(tl.float32)
+    zp_K = tl.load(ku16 + (K_ZP_OFFSET // 2) + d_offs).to(
+        tl.float16, bitcast=True).to(tl.float32)
+    s_row_K = tl.load(ku16 + (K_S_ROW_OFFSET // 2) + g_offs).to(
+        tl.float16, bitcast=True).to(tl.float32)
+
+    k_addrs = (tile_base + K_PACKED_OFFSET
+               + d_offs[:, None] * (GROUP // PACK_K) + g_byte_k[None, :])
+    k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
+    q_K = ((k_bytes >> g_shift_k[None, :]) & MASK_K).to(tl.float32)
+    K_rot = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]
+    K_pool = tl.trans(K_rot)
+
+    s_col_V = tl.load(ku16 + (V_S_COL_OFFSET // 2) + d_offs).to(
+        tl.float16, bitcast=True).to(tl.float32)
+    s_row_V = tl.load(ku16 + (V_S_ROW_OFFSET // 2) + g_offs).to(
+        tl.float16, bitcast=True).to(tl.float32)
+    zp_V = tl.load(ku16 + (V_ZP_OFFSET // 2) + g_offs).to(
+        tl.float16, bitcast=True).to(tl.float32)
+    v_addrs = (tile_base + V_PACKED_OFFSET
+               + g_offs[:, None] * (D // PACK_V) + d_byte_v[None, :])
+    v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
+    q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+    V_pool = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]
+
+    pool_base = slot * stride_pool_b + hk * stride_pool_h
+    out_addrs = pool_base + g_offs[:, None] * stride_pool_t + d_offs[None, :]
+    tl.store(Tail_K_pool_ptr + out_addrs, K_pool.to(tl.float16))
+    tl.store(Tail_V_pool_ptr + out_addrs, V_pool.to(tl.float16))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Pool→packed gather: copy already-rotated fp16 tail-pool tokens (sink + tail)
 # into the same packed buffer that flash_attn_varlen consumes.

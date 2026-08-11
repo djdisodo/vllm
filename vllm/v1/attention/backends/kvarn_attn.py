@@ -686,6 +686,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             dict_map = KVarNAttentionImpl._block_to_slot_dict[gk]
             free_slots = KVarNAttentionImpl._free_slots[gk]
             sinks = KVarNAttentionImpl._global_sink_blocks[gk]
+            pending_cow_dst = KVarNAttentionImpl._pending_cow_dst_blocks.setdefault(
+                gk, set())
 
             # ORDER MATTERS: mark sinks → FLUSH (frees just-completed blocks'
             # slots) → ALLOCATE (the new tails, reusing the freed slots). Doing
@@ -843,6 +845,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     b2s_t[bid] = -1
 
             # (3) Allocate slots for any new block_ids (sinks + new tails).
+            cow_init_pairs: list[tuple[int, int]] = []
             for bid in blocks_needed:
                 if bid not in dict_map:
                     if not free_slots and self._retired_sinks:
@@ -878,6 +881,16 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     KVarNAttentionImpl._max_known_block_id[gk] = max(
                         KVarNAttentionImpl._max_known_block_id.get(gk, 0), bid
                     )
+                    if bid in pending_cow_dst:
+                        cow_init_pairs.append((bid, slot))
+                elif bid in pending_cow_dst:
+                    cow_init_pairs.append((bid, dict_map[bid]))
+
+            if cow_init_pairs:
+                KVarNAttentionImpl._init_pool_slots_from_cache(
+                    group_impls, cow_init_pairs)
+                for bid, _ in cow_init_pairs:
+                    pending_cow_dst.discard(bid)
 
             # (4) Promote accepted MTP draft tokens from last step's scratch
             # into the durable fp16 tail pool. `num_accepted_tokens` belongs to
@@ -1137,6 +1150,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _draft_slot_to_index: ClassVar[dict[tuple, dict[int, int]]] = {}
     _draft_free_indices: ClassVar[dict[tuple, list[int]]] = {}
     _draft_scratch_size: ClassVar[dict[tuple, int]] = {}
+    _pending_cow_dst_blocks: ClassVar[dict[tuple, set[int]]] = {}
     # Keys (device, D, group, k_bits, v_bits) whose flush kernels (Sinkhorn +
     # int4 store) have already been JIT-compiled via the pool-init warmup.
     _kernel_warmed: ClassVar[set] = set()
@@ -1149,6 +1163,77 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     def _impls_for_group(cls, group_key: tuple) -> list["KVarNAttentionImpl"]:
         """Impls belonging to one KV-cache group (same group_key)."""
         return [i for i in cls._all_impls if i._group_key == group_key]
+
+    @classmethod
+    def prepare_kv_cache_block_copies(cls, block_copies) -> None:
+        """Make vLLM CoW block copies coherent with KVarN's fp16 pool.
+
+        The generic copy path only copies the compressed KV-cache storage. KVarN
+        may still hold a source block's freshest bytes in the fp16 tail pool, so
+        flush pool-resident sources first. Destinations are marked for pool
+        initialization when the metadata builder allocates their write slot.
+        """
+        if not block_copies or not cls._all_impls:
+            return
+        src_ids = {int(c.src_block_id) for c in block_copies}
+        dst_ids = {int(c.dst_block_id) for c in block_copies}
+        for gk, dict_map in list(cls._block_to_slot_dict.items()):
+            cls._pending_cow_dst_blocks.setdefault(gk, set()).update(dst_ids)
+            src_to_flush = [bid for bid in src_ids if bid in dict_map]
+            if not src_to_flush:
+                continue
+            flush_pairs = []
+            for impl in cls._impls_for_group(gk):
+                kvc = getattr(impl, "_kv_cache_ref", None)
+                if kvc is None:
+                    continue
+                for bid in src_to_flush:
+                    flush_pairs.append((impl, bid, kvc))
+            cls._batched_flush(flush_pairs)
+
+    @classmethod
+    def _init_pool_slots_from_cache(
+        cls,
+        group_impls: list["KVarNAttentionImpl"],
+        init_pairs: list[tuple[int, int]],
+    ) -> None:
+        if not group_impls or not init_pairs:
+            return
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            _kvarn_dequant_cache_blocks_to_pool_kernel,
+        )
+
+        for impl in group_impls:
+            kvc = getattr(impl, "_kv_cache_ref", None)
+            if (kvc is None or impl._tail_K_pool is None
+                    or impl._tail_V_pool is None):
+                continue
+            device = impl._tail_K_pool.device
+            bids = torch.as_tensor([p[0] for p in init_pairs],
+                                   dtype=torch.long, device=device)
+            slots = torch.as_tensor([p[1] for p in init_pairs],
+                                    dtype=torch.long, device=device)
+            cfg = impl.kvarn_config
+            _kvarn_dequant_cache_blocks_to_pool_kernel[
+                (len(init_pairs), impl.num_kv_heads)
+            ](
+                kvc, bids, slots, impl._tail_K_pool, impl._tail_V_pool,
+                kvc.stride(0), kvc.stride(1),
+                impl._tail_K_pool.stride(0),
+                impl._tail_K_pool.stride(1),
+                impl._tail_K_pool.stride(2),
+                D=cfg.head_dim, GROUP=cfg.group,
+                K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
+                K_PACKED_OFFSET=cfg.k_packed_offset,
+                K_S_COL_OFFSET=cfg.k_s_col_offset,
+                K_ZP_OFFSET=cfg.k_zp_offset,
+                K_S_ROW_OFFSET=cfg.k_s_row_offset,
+                V_PACKED_OFFSET=cfg.v_packed_offset,
+                V_S_COL_OFFSET=cfg.v_s_col_offset,
+                V_S_ROW_OFFSET=cfg.v_s_row_offset,
+                V_ZP_OFFSET=cfg.v_zp_offset,
+                num_warps=4, num_stages=2,
+            )
 
     def __init__(
         self,

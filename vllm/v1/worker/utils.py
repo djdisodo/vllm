@@ -568,6 +568,12 @@ def copy_kv_cache_blocks_inplace(
     if not kv_cache_block_copies:
         return
 
+    try:
+        from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+        KVarNAttentionImpl.prepare_kv_cache_block_copies(kv_cache_block_copies)
+    except ImportError:
+        pass
+
     storage_tensors: list[torch.Tensor] = []
     seen_storage: set[int] = set()
     for entry in kv_caches:
