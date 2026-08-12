@@ -354,16 +354,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # must be flushed (a future prefix-cache hit may read it), a partial
         # one is safe to discard (vLLM never prefix-caches partial blocks).
         self._block_fill: dict[int, int] = {}
-        # Retired sinks: finished requests' sink blocks, kept RESIDENT in the
-        # fp16 pool (insertion order = retirement order) instead of flushed on
-        # reclaim. A prefix-cache hit re-adopts the block with its fp16 data
-        # byte-identical — preserving KVarN's fp16-sink accuracy on multi-turn
-        # traffic, where every follow-up turn reuses the previous turn's first
-        # block. Evicted (flushed to int4, so later cache hits still find a
-        # valid tile) lazily, oldest first, only when slot allocation runs
-        # dry — residency therefore never shrinks live capacity.
-        self._retired_sinks: dict[int, None] = {}
-
         # Max model length (for the fixed FA grid bound + max_blocks_per_req).
         try:
             self._max_model_len = vllm_config.model_config.max_model_len
@@ -717,24 +707,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     continue
                 row0_set.add(s0)
                 if s0 in sinks:
-                    blocks_needed.add(s0)          # live/retired sink keeps its slot
+                    blocks_needed.add(s0)          # live sink keeps its slot
                 elif s0 in blocks_needed:          # written this step → fresh sink
                     sinks.add(s0)
                     if s0 < is_sink_t.shape[0]:
                         is_sink_t[s0] = True
-
-            # Un-retire any retired block named this step: a prefix-cache hit
-            # re-adopting a retired sink (its fp16 data is intact and byte-
-            # identical), or vLLM recycling the id for a fresh write. Either
-            # way the block is live again and must not be evicted under it.
-            # A recycled block that is no request's first block sheds its
-            # stale sink label so the normal walk-back flush applies to it.
-            for bid in [b for b in self._retired_sinks if b in blocks_needed]:
-                self._retired_sinks.pop(bid, None)
-                if bid not in row0_set and bid in sinks:
-                    sinks.discard(bid)
-                    if bid < is_sink_t.shape[0]:
-                        is_sink_t[bid] = False
 
             # (2) Flush detection (Stage α-2 Step B).
             # CRITICAL timing: token (k+1)*GROUP-1 (the one that completes
@@ -785,21 +762,17 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
 
             # (2b) Reclaim slot-holding blocks neither written this step nor
             # queued above: they belong to finished (or preempted) requests.
-            # A COMPLETE sink is RETIRED — kept fp16-resident so a prefix-
-            # cache hit (every follow-up chat turn) re-adopts it byte-
-            # identically; the old discard destroyed its fp16-only data
-            # outright, garbling every multi-turn cache hit (issue #10 loops).
-            # Any other COMPLETE block is FLUSHED — vLLM's prefix cache may
-            # hand it to a future request, which must find a valid int4 tile
-            # (the old discard left stale tile bytes). A PARTIAL block is
-            # discarded: vLLM never prefix-caches partial blocks.
+            # Every COMPLETE block is flushed, including sink/block-0. Keeping
+            # a finished sink fp16-resident is unsafe without a vLLM block
+            # lifetime generation: the physical block id can later be recycled,
+            # while KVarN would still map it to the old fp16 pool slot. Prefix-
+            # cache hits then read stale fp16 data instead of the copied int4
+            # backing cache. A PARTIAL block is discarded because vLLM never
+            # prefix-caches partial blocks.
             discard_ids: list[int] = []
             for bid in [b for b in dict_map
                         if b not in blocks_needed and b not in flush_seen]:
                 full = self._block_fill.get(bid, 0) >= GROUP
-                if full and bid in sinks:
-                    self._retired_sinks[bid] = None   # idempotent re-insert
-                    continue
                 if full:
                     flush_seen.add(bid)
                     flush_block_ids.append(bid)
@@ -848,27 +821,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             cow_init_pairs: list[tuple[int, int]] = []
             for bid in blocks_needed:
                 if bid not in dict_map:
-                    if not free_slots and self._retired_sinks:
-                        # Evict the oldest retired sink: flush it to int4 so a
-                        # later prefix-cache hit still finds a valid tile, then
-                        # hand its slot to the live allocation.
-                        old = next(iter(self._retired_sinks))
-                        self._retired_sinks.pop(old)
-                        evict_pairs = [
-                            (impl, old, impl._kv_cache_ref)
-                            for impl in group_impls
-                            if getattr(impl, "_kv_cache_ref", None) is not None
-                        ]
-                        KVarNAttentionImpl._batched_flush(evict_pairs)
-                        old_slot = dict_map.pop(old, None)
-                        self._block_fill.pop(old, None)
-                        sinks.discard(old)
-                        if old < is_sink_t.shape[0]:
-                            is_sink_t[old] = False
-                        if old < b2s_t.shape[0]:
-                            b2s_t[old] = -1
-                        if old_slot is not None:
-                            free_slots.append(old_slot)
                     if not free_slots:
                         raise RuntimeError(
                             f"KVarN pool exhausted "
