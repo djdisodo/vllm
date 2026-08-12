@@ -1172,6 +1172,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         may still hold a source block's freshest bytes in the fp16 tail pool, so
         flush pool-resident sources first. Destinations are marked for pool
         initialization when the metadata builder allocates their write slot.
+        After the forced source flush, retire the source from the fp16 lookup:
+        the compressed cache is now authoritative and a stale block->slot mapping
+        could later alias a reused pool slot.
         """
         if not block_copies or not cls._all_impls:
             return
@@ -1189,7 +1192,23 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                     continue
                 for bid in src_to_flush:
                     flush_pairs.append((impl, bid, kvc))
+            if not flush_pairs:
+                continue
             cls._batched_flush(flush_pairs)
+            free_slots = cls._free_slots.get(gk)
+            sinks = cls._global_sink_blocks.get(gk)
+            for bid in src_to_flush:
+                slot = dict_map.pop(bid, None)
+                if slot is not None and free_slots is not None:
+                    free_slots.append(slot)
+                if sinks is not None:
+                    sinks.discard(bid)
+                for (device, key), b2s_t in list(cls._block_to_slot_t_per_device.items()):
+                    if key == gk and bid < b2s_t.shape[0]:
+                        b2s_t[bid] = -1
+                for (device, key), is_sink_t in list(cls._is_sink_t_per_device.items()):
+                    if key == gk and bid < is_sink_t.shape[0]:
+                        is_sink_t[bid] = False
 
     @classmethod
     def _init_pool_slots_from_cache(
