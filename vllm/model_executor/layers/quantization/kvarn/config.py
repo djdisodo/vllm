@@ -108,21 +108,16 @@ class KVarNConfig:
 
     @property
     def tile_bytes_aligned(self) -> int:
-        """tile_bytes rounded up for nicer Triton loads.
+        """tile_bytes rounded up to a minimal trailing alignment.
 
-        For head_dim >= 256 we round the PER-TOKEN slot (tile_bytes / group) up to
-        a power of 2. This is required for models with heterogeneous head_dim
-        (e.g. Gemma-4: 256 sliding-window layers + 512 global layers): the raw
-        slot has a fixed per-token-group scale term that doesn't scale with D, so
-        slot(512)/slot(256) is not an integer and vLLM's KV-cache page-size
-        unification (which scales block_size by that ratio) fails. Power-of-2 slots
-        make the ratio an exact power of 2. head_dim<=128 keeps the tight 8-byte
-        alignment (the common case; no padding). Trailing pad only — offsets are
-        unchanged, so the layout/kernels are byte-compatible."""
-        if self.head_dim >= 256:
-            slot = math.ceil(self.tile_bytes / self.group)
-            slot_pow2 = 1 << (slot - 1).bit_length()
-            return slot_pow2 * self.group
+        KVarN kernels address fields by explicit byte offsets; padding is only
+        a trailing region after the packed K/V and scale data. The earlier
+        large-head power-of-two slot padding made vLLM page-size unification
+        easier for some heterogeneous layouts, but it also nearly doubled
+        Qwen3.6 k4v4_g128 storage (35072 -> 65536 bytes/tile). Page planning
+        must handle the actual KVarN cache spec instead of relying on padded
+        tile sizes to mask incompatible specs.
+        """
         return ((self.tile_bytes + 7) // 8) * 8
 
     # ── slot byte offsets within one tile (used by the kernels) ──────────────

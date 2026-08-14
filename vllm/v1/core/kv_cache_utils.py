@@ -1076,12 +1076,25 @@ def unify_kv_cache_spec_page_size(
             new_kv_cache_spec[layer_name] = new_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
+            is_kvarn_spec = (
+                isinstance(layer_spec, AttentionSpec)
+                and layer_spec.kv_quant_mode.is_kvarn
+            )
             if max_page_size % layer_page_size == 0:
                 ratio = max_page_size // layer_page_size
-                if getattr(layer_spec, "tq_slot_size", 0) > 0:
-                    # KVarN/TQ specs are group-locked: their block_size must
-                    # equal the quantization tile size, so grow the page by
-                    # padding rather than changing block_size.
+                if is_kvarn_spec:
+                    # KVarN stores one physical record per quantization tile
+                    # and vLLM may group multiple tiles into one scheduler
+                    # block. Generic page padding cannot represent "N tight
+                    # tile records, then a gap" as a flat tensor stride, so
+                    # grow the logical scheduler block when the pages are
+                    # divisible instead of padding between pages.
+                    new_block_size = layer_spec.block_size * ratio
+                    new_spec = replace(layer_spec, block_size=new_block_size)
+                elif getattr(layer_spec, "tq_slot_size", 0) > 0:
+                    # TQ specs are group-locked: their block_size must equal
+                    # the quantization tile size, so grow the page by padding
+                    # rather than changing block_size.
                     new_spec = replace(layer_spec, page_size_padded=max_page_size)
                 else:
                     new_block_size = layer_spec.block_size * ratio
@@ -1089,6 +1102,7 @@ def unify_kv_cache_spec_page_size(
             elif (
                 isinstance(layer_spec, AttentionSpec)
                 and layer_spec.indexes_kv_by_block_stride
+                and not is_kvarn_spec
             ):
                 new_spec = replace(layer_spec, page_size_padded=max_page_size)
             else:
