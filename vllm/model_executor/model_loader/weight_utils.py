@@ -1112,8 +1112,8 @@ def instanttensor_weights_iterator(
             "Please install instanttensor via `pip install vllm[instanttensor]`"
         ) from e
 
-    if not current_platform.is_cuda():
-        raise ValueError("InstantTensor requires NVIDIA GPUs")
+    if not current_platform.is_cuda_alike():
+        raise ValueError("InstantTensor requires CUDA-like GPUs")
 
     try:
         world_group = get_world_group()
@@ -1132,7 +1132,7 @@ def instanttensor_weights_iterator(
         framework="pt",
         device=device,
         process_group=process_group,
-        copy=True,
+        copy=envs.VLLM_INSTANTTENSOR_COPY,
     ) as f:
         # Track bytes so the bar reports load throughput (GB/s).
         pbar = tqdm(
