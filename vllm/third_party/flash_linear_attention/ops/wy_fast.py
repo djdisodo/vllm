@@ -16,12 +16,18 @@ from vllm.triton_utils import tl, triton
 from .index import prepare_chunk_indices
 
 
+# A four-stage pipeline over the two-trip `u` loop can issue a third,
+# consumer-less async copy into LDS that the following `w` loop reuses. This
+# races on ROCm (vLLM #50649), producing non-deterministic O(1e38) values.
+_RECOMPUTE_W_U_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
+
+
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for num_stages in _RECOMPUTE_W_U_NUM_STAGES
     ],
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
 )
